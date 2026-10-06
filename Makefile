@@ -20,7 +20,7 @@ endif
 
 ELF := LeftStickKiller.elf
 
-CFLAGS := -Wall -O2 -lScePad -lSceUserService -lSceNotification
+CFLAGS := -Wall -O2 -lSceNotification
 
 all: $(ELF)
 
