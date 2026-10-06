@@ -20,15 +20,18 @@ endif
 
 ELF := LeftStickKiller.elf
 
-CFLAGS := -Wall -O2 -lSceNotification
+CFLAGS := -Wall -O2
+LDADD  := -lSceNotification
+
+OBJS := main.o pt.o
 
 all: $(ELF)
 
-$(ELF): main.c
-	$(CC) $(CFLAGS) -o $@ $^
+$(ELF): $(OBJS)
+	$(CC) -o $@ $^ $(LDADD)
 
 clean:
-	rm -f $(ELF)
+	rm -f $(ELF) $(OBJS)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
