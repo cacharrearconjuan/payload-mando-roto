@@ -8,50 +8,44 @@ Los otros mandos conectados siguen funcionando con normalidad.
 
 No es persistente: vive en segundo plano y **desaparece al apagar o reiniciar**.
 
-## Objetivo y cómo está construido (dos pasos)
+## Estado: desarrollo por pasos
 
 Para que el stick quede centrado **dentro de los juegos** hay que enganchar
-(*hook*) la función `scePadReadState` en el proceso del juego. Un *hook* mal
-hecho cuelga el juego, y eso depende de cómo sea esa función en tu firmware
-exacto. Por eso se hace en dos pasos:
+(*hook*) la funcion `scePadReadState` en el proceso del juego. Un *hook* mal
+hecho cuelga el juego, y depende de como sea esa funcion en tu firmware
+exacto. Por eso se hace en pasos, probando en la consola.
 
-### PASO 1 — Sonda (lo que hay ahora, es SEGURO)
+### PASO 1b - Sonda (lo que hay ahora, SOLO LECTURA, no cuelga nada)
 
-`main.c` actual. Solo **lee**, no modifica nada, no puede colgar juegos:
+`main.c` actual. No modifica nada:
 
-1. Enumera los procesos que tienen cargada `libScePad` (el juego y la interfaz
-   del sistema).
-2. Localiza la dirección de `scePadReadState` en cada uno.
-3. Lee sus primeros 16 bytes (el "prólogo").
-4. Escribe un informe en **`/data/LeftStickKiller.log`** y muestra avisos en
-   pantalla.
+1. Lista **todos** los procesos (para localizar el del juego, se llame como se
+   llame).
+2. En los que tienen `libScePad`, localiza `scePadReadState` y vuelca 64 bytes
+   de esa funcion (para medir el relleno y elegir la tecnica de hook mas
+   segura).
+3. Escribe un informe en **`/data/LeftStickKiller.log`** y muestra avisos.
 
-Con el contenido de ese log se escribe el hook del paso 2, hecho a medida de tu
-11.60 para que no cuelgue.
+Resultado conocido del PASO 1: el acceso de kernel, la resolucion de simbolos y
+la lectura de memoria de otros procesos **funcionan** en 11.60, y
+`scePadReadState` es un *thunk* corto (`xor edx,edx; jmp impl_real`).
 
-### PASO 2 — Hook real (siguiente versión)
+### PASO 2 - Hook real (siguiente version)
 
 Con los datos del paso 1: inyectar en el proceso del juego un *hook* de
 `scePadReadState` que detecta L1 + R1 + R3 (marca ese mando) y fuerza su stick
-izquierdo al centro. Autónomo por mando: solo afecta al mando marcado.
+izquierdo al centro. Autonomo por mando: solo afecta al mando marcado.
 
-## Cómo usar el PASO 1
+## Conseguir el `.elf`
 
-1. Carga el payload con el cargador ELF en el puerto 9021:
+> El `.elf` de confianza es el **artefacto de GitHub Actions**, no el binario
+> que pueda haber commiteado en el repo (ese puede quedar desfasado).
 
-   ```console
-   nc -q0 <IP_de_tu_PS5> 9021 < LeftStickKiller.elf
-   ```
+Cada push compila el payload. Entra en la pestana **Actions**, abre la
+compilacion mas reciente, espera el tic verde y descarga el artefacto
+`LeftStickKiller` (un zip con `LeftStickKiller.elf`).
 
-2. Aparece *"sondeando"*. **Abre un juego** y espera ~1 minuto.
-3. Aparece *"Sonda OK: N proceso(s)"*.
-4. Recupera **`/data/LeftStickKiller.log`** (por ejemplo con un payload FTP como
-   [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv)) y pásame su contenido.
-
-Si sale *"No pude leer ningún proceso"*, dímelo: significa que el payload no
-tiene acceso de kernel en tu configuración y hay que ajustar cómo se lanza.
-
-## Compilar
+Tambien puedes compilarlo tu mismo:
 
 ```console
 wget https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
@@ -60,8 +54,19 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 make
 ```
 
-Cada push a este repositorio compila `LeftStickKiller.elf` automáticamente
-(GitHub Actions) y lo deja como artefacto descargable.
+## Cargar y usar (PASO 1b)
+
+1. Carga el payload con el cargador ELF en el puerto 9021:
+
+   ```console
+   nc -q0 <IP_de_tu_PS5> 9021 < LeftStickKiller.elf
+   ```
+
+2. Aparece *"Sondeando. ABRE EL JUEGO..."*. Abre el juego que quieres usar y
+   espera ~1 minuto.
+3. Aparece *"Sonda OK: N proceso(s)"*.
+4. Recupera **`/data/LeftStickKiller.log`** (por ejemplo con un payload FTP como
+   [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv)) y pasa su contenido.
 
 ## Licencia
 
