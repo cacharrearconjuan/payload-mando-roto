@@ -23,7 +23,8 @@ ELF := LeftStickKiller.elf
 CFLAGS := -Wall -O2
 LDADD  := -lSceNotification
 
-OBJS := main.o pt.o
+# Opcion A: ya no se usa ptrace, asi que no compilamos pt.o.
+OBJS := main.o
 
 all: $(ELF)
 

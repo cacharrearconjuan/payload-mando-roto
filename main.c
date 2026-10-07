@@ -1,36 +1,34 @@
-/* LeftStickKiller - PASO 2: hook residente de scePadReadState
+/* LeftStickKiller - PASO 2 (Opcion A): hook de scePadReadState SIN ptrace
  *
  * Objetivo (accesibilidad / reparacion): un DualSense concreto tiene el
  * stick izquierdo roto a nivel de placa y deriva hacia la izquierda. Este
- * payload inyecta en el proceso del juego un hook de scePadReadState que:
+ * payload inyecta en el proceso del juego un hook de scePadReadState que
+ * deja pasar la lectura real del mando y, acto seguido, fija el stick
+ * izquierdo en el centro (X=0x80, Y=0x80), anulando la deriva.
  *
- *   1. Deja pasar la lectura real del mando.
- *   2. Si en esa lectura ese mando tiene pulsado L1 + R1 + R3, MARCA ese
- *      mando (por su "handle").
- *   3. En todas las lecturas del mando marcado, fija el stick izquierdo en
- *      el centro (X=0x80, Y=0x80), anulando la deriva.
+ * SIMPLIFICACION: centra el stick izquierdo en TODAS las lecturas mientras
+ * el payload este cargado. Como se usa un mando a la vez y el payload no es
+ * persistente, no hace falta logica por-mando ni combinacion de botones:
+ *   cargalo SOLO cuando uses el mando roto; desaparece al reiniciar.
  *
- * Es autonomo por mando: solo afecta al que pulso la combinacion. Los demas
- * mandos siguen funcionando con normalidad.
- *
- * No es persistente: vive en segundo plano y desaparece al reiniciar.
- *
- * Tecnica (sin etaHEN, firmware 11.60):
- *   - Enumera procesos (KERN_PROC_ALL), localiza el del juego (tiene
+ * Tecnica (SIN ptrace, sin etaHEN, firmware 11.60):
+ *   - Enumera procesos (KERN_PROC_PROC), localiza el del juego (tiene
  *     libScePad y no es del sistema).
- *   - Con ptrace (pt.c de ps5-payload-dev/elfldr) se engancha brevemente,
- *     reserva una pagina RWX via kernel_mprotect y escribe un pequeno
- *     trampolin en shellcode.
- *   - Reescribe el salto del thunk de scePadReadState
- *     (xor edx,edx ; jmp impl)  para que apunte al trampolin. El trampolin
- *     llama a la implementacion real, inspecciona los datos y, si procede,
+ *   - Resuelve scePadReadState (kernel_dynlib_handle + kernel_dynlib_dlsym).
+ *     Es un thunk corto:
+ *         31 d2            xor edx, edx
+ *         e9 <rel32>       jmp impl_real      ; impl_real = thunk + 7 + rel32
+ *   - Busca un "code cave" (racha de 0xCC) DENTRO del rango ejecutable de
+ *     libScePad, escaneando con kernel_proc_copyout.
+ *   - Escribe el stub en ese hueco:
+ *         kernel_mprotect(RWX) -> kernel_proc_copyin(stub) -> kernel_mprotect(RX)
+ *   - Repunta el jmp del thunk (reescribe su rel32 en thunk+3) para que
+ *     salte al stub. El stub llama a impl_real (direccion ABSOLUTA) y luego
  *     centra el stick izquierdo.
  *
- * Datos del reconocimiento (PASO 1): acceso de kernel OK, resolucion de
- * simbolos y copyout de otros procesos OK en 11.60, y scePadReadState es un
- * thunk corto identico en todos los procesos:
- *     31 d2            xor edx, edx
- *     e9 89 eb ff ff   jmp impl_real
+ * No usa ptrace: ni pt_attach, ni pt_mmap. Todo via el R/W de kernel del SDK,
+ * que el reconocimiento (PASO 1) ya verifico que funciona sobre el proceso
+ * del juego en 11.60 (handle/dlsym, copyin/copyout, mprotect).
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev.
  */
@@ -47,22 +45,9 @@
 #include <sys/sysctl.h>
 #include <sys/mman.h>
 
-#include "pt.h"
-
 #define LOG_PATH "/data/LeftStickKiller.log"
 
-/* Mascaras de botones de ScePad */
-#define SCE_PAD_BUTTON_R3 0x00000004u
-#define SCE_PAD_BUTTON_L1 0x00000400u
-#define SCE_PAD_BUTTON_R1 0x00000800u
-#define COMBO (SCE_PAD_BUTTON_L1 | SCE_PAD_BUTTON_R1 | SCE_PAD_BUTTON_R3) /* 0xC04 */
-
-/* Pagina de 16 KiB (PS5) */
-#define PS5_PAGE 0x4000
-
-/* En ScePadData: buttons en +0, leftStick.x en +4, leftStick.y en +5. */
-#define OFF_LEFT_X 4
-#define OFF_LEFT_Y 5
+/* En ScePadData: leftStick.x en +4, leftStick.y en +5 (el stub los fija). */
 
 /* ---- Aviso en pantalla (libSceNotification) ---------------------- */
 
@@ -128,77 +113,86 @@ is_system_proc(const char *name) {
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
 }
 
-/* ---- Construccion del trampolin (shellcode x86-64) --------------- */
+/* ---- Construccion del stub (shellcode x86-64) -------------------- */
 /*
- * Entrada (ABI SysV, igual que scePadReadState):
- *   rdi = handle, rsi = *ScePadData, (edx = contador, lo ponemos a 0)
+ * Entrada (via el jmp del thunk; este ya ejecuto xor edx,edx):
+ *   rdi = handle, rsi = *ScePadData, edx = 0
  *
- * Esquema:
- *   xor edx,edx                 ; contador = 0 (auto-suficiente)
- *   push rbp ; mov rbp,rsp
- *   push rdi ; push rsi         ; guardar args (impl los puede pisar)
- *   mov rax, impl_real ; call rax
- *   mov rsi,[rbp-16] ; mov rdi,[rbp-8]
- *   mov r9, rax                 ; preservar valor de retorno
- *   mov ecx,[rsi] ; and ecx,0xC04 ; cmp ecx,0xC04
- *   jne .nocombo
- *     mov r10, &marked ; mov [r10], edi   ; marcar este handle
- *   .nocombo:
- *   mov r10, &marked ; mov eax,[r10] ; cmp eax,edi
- *   jne .fin
- *     mov byte[rsi+4],0x80 ; mov byte[rsi+5],0x80  ; centrar stick izq.
- *   .fin:
- *   mov rax,r9 ; mov rsp,rbp ; pop rbp ; ret
+ * Esquema (26 bytes). Preserva rsi en rbx (callee-saved) para no perder el
+ * puntero a ScePadData si impl_real lo pisa; preserva rax (valor de retorno).
  *
- * marked vive en la misma pagina RWX (offset 0); el codigo en +0x40.
+ *   push rbx                 ; 53
+ *   mov  rbx, rsi            ; 48 89 F3
+ *   mov  rax, impl_real      ; 48 B8 <imm64>   (direccion ABSOLUTA)
+ *   call rax                 ; FF D0           (llama a la lectura real)
+ *   mov  byte [rbx+4], 0x80  ; C6 43 04 80     (leftStick.x = centro)
+ *   mov  byte [rbx+5], 0x80  ; C6 43 05 80     (leftStick.y = centro)
+ *   pop  rbx                 ; 5B
+ *   ret                      ; C3
+ *
+ * Alineacion de pila: se entra con rsp%16==8 (tras el call del juego al thunk).
+ * push rbx -> rsp%16==0, por lo que 'call rax' deja a impl_real con rsp%16==8,
+ * correcto para la ABI SysV.
  */
 
-#define CODE_OFF   0x40          /* trampolin dentro de la pagina */
-#define MARKED_OFF 0x00          /* int32: handle marcado, -1 = ninguno */
-
 static size_t
-build_shellcode(uint8_t *sc, intptr_t page, intptr_t impl_real) {
+build_shellcode(uint8_t *sc, intptr_t impl_real) {
   static const uint8_t tpl[] = {
-    0x31, 0xD2,                                     /* xor edx,edx         */
-    0x55,                                           /* push rbp            */
-    0x48, 0x89, 0xE5,                               /* mov rbp,rsp         */
-    0x57,                                           /* push rdi            */
-    0x56,                                           /* push rsi            */
-    0x48, 0xB8, 0,0,0,0,0,0,0,0,                     /* mov rax, impl  @10  */
-    0xFF, 0xD0,                                     /* call rax            */
-    0x48, 0x8B, 0x75, 0xF0,                         /* mov rsi,[rbp-16]    */
-    0x48, 0x8B, 0x7D, 0xF8,                         /* mov rdi,[rbp-8]     */
-    0x49, 0x89, 0xC1,                               /* mov r9,rax          */
-    0x8B, 0x0E,                                     /* mov ecx,[rsi]       */
-    0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,             /* and ecx,0xC04       */
-    0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,             /* cmp ecx,0xC04       */
-    0x75, 0x0D,                                     /* jne .nocombo (+13)  */
-    0x49, 0xBA, 0,0,0,0,0,0,0,0,                     /* mov r10,&marked @49 */
-    0x41, 0x89, 0x3A,                               /* mov [r10],edi       */
-    0x49, 0xBA, 0,0,0,0,0,0,0,0,                     /* mov r10,&marked @62 */
-    0x41, 0x8B, 0x02,                               /* mov eax,[r10]       */
-    0x39, 0xF8,                                     /* cmp eax,edi         */
-    0x75, 0x08,                                     /* jne .fin (+8)       */
-    0xC6, 0x46, 0x04, 0x80,                         /* mov byte[rsi+4],80h */
-    0xC6, 0x46, 0x05, 0x80,                         /* mov byte[rsi+5],80h */
-    0x4C, 0x89, 0xC8,                               /* mov rax,r9          */
-    0x48, 0x89, 0xEC,                               /* mov rsp,rbp         */
-    0x5D,                                           /* pop rbp             */
-    0xC3,                                           /* ret                 */
+    0x53,                             /* push rbx                */
+    0x48, 0x89, 0xF3,                 /* mov  rbx, rsi           */
+    0x48, 0xB8, 0,0,0,0,0,0,0,0,       /* mov  rax, impl_real @6  */
+    0xFF, 0xD0,                       /* call rax                */
+    0xC6, 0x43, 0x04, 0x80,           /* mov byte [rbx+4], 0x80  */
+    0xC6, 0x43, 0x05, 0x80,           /* mov byte [rbx+5], 0x80  */
+    0x5B,                             /* pop  rbx                */
+    0xC3,                             /* ret                     */
   };
-  intptr_t marked = page + MARKED_OFF;
   memcpy(sc, tpl, sizeof(tpl));
-  memcpy(sc + 10, &impl_real, 8);
-  memcpy(sc + 49, &marked, 8);
-  memcpy(sc + 62, &marked, 8);
+  memcpy(sc + 6, &impl_real, 8);
   return sizeof(tpl);
+}
+
+/* ---- Busqueda de code cave (racha de 0xCC ejecutable) ------------ */
+/*
+ * Escanea hacia delante con kernel_proc_copyout buscando 'need' bytes 0xCC
+ * consecutivos. Empieza en 'start' (alineado a pagina) y para cuando copyout
+ * falla (fin del mapeo) o al llegar al tope. Devuelve la direccion del hueco
+ * o 0 si no hay ninguno suficientemente grande.
+ */
+static intptr_t
+find_code_cave(pid_t pid, intptr_t start, size_t need) {
+  uint8_t chunk[0x1000];
+  intptr_t run_start = 0;
+  size_t run_len = 0;
+  intptr_t addr = start & ~((intptr_t)0xFFF);
+  intptr_t limit = addr + 0x600000; /* tope de escaneo: 6 MiB */
+
+  for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
+    if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
+      break; /* fin del mapeo ejecutable del modulo */
+    }
+    for (size_t i = 0; i < sizeof(chunk); i++) {
+      if (chunk[i] == 0xCC) {
+        if (run_len == 0) {
+          run_start = addr + (intptr_t)i;
+        }
+        run_len++;
+        if (run_len >= need) {
+          return run_start;
+        }
+      } else {
+        run_len = 0;
+      }
+    }
+  }
+  return 0;
 }
 
 /* ---- Hook en un proceso ------------------------------------------ */
 
 /* Devuelve:
  *    1  = hook aplicado (marcar el pid, no reintentar)
- *    0  = aun no tiene libScePad (NO marcar; reintentar en el proximo barrido)
+ *    0  = aun no tiene libScePad/simbolo (NO marcar; reintentar luego)
  *   -1  = tiene libScePad pero algo salio mal (marcar; no reintentar)
  */
 static int
@@ -230,85 +224,76 @@ hook_pad(pid_t pid, const char *name) {
   memcpy(&rel, &head[3], 4);
   intptr_t impl_real = thunk + 7 + rel; /* destino del jmp original */
 
-  /* Enganchar el proceso */
-    logline("  -> antes de pt_attach");
-  if (pt_attach(pid) != 0) {
-    logline("  pt_attach fallo");
+  /* Construir el stub (su tamano define el cave que necesitamos). */
+  uint8_t sc[64];
+  size_t sclen = build_shellcode(sc, impl_real);
+
+  /* Base del modulo para escanear su .text; si no hay, desde impl_real. */
+  intptr_t mapbase = kernel_dynlib_mapbase_addr(pid, handle);
+  intptr_t scan_from = (mapbase > 0) ? mapbase : impl_real;
+
+  char m[192];
+  snprintf(m, sizeof(m),
+           "  pid=%d (%s): thunk=0x%lx impl=0x%lx mapbase=0x%lx need=%u",
+           (int)pid, name, (unsigned long)thunk, (unsigned long)impl_real,
+           (unsigned long)mapbase, (unsigned)sclen);
+  logline(m);
+
+  intptr_t cave = find_code_cave(pid, scan_from, sclen);
+  if (!cave) {
+    logline("  NO hay code cave suficiente en libScePad -> aborto (no arriesgo)");
     return -1;
   }
-  logline("  -> pt_attach OK");
-  int rc = -1;
-  do {
-    /* Reservar pagina para datos + trampolin */
-    intptr_t page = pt_mmap(pid, 0, PS5_PAGE, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == -1) {
-      logline("  pt_mmap fallo");
-      break;
-    }
+  char c[96];
+  snprintf(c, sizeof(c), "  code cave encontrado en 0x%lx (%u bytes)",
+           (unsigned long)cave, (unsigned)sclen);
+  logline(c);
 
-    /* marked = -1 (ningun mando marcado todavia) */
-    pt_setint(pid, page + MARKED_OFF, (int)0xFFFFFFFF);
+  /* Escribir el stub en el cave: RWX -> copyin -> RX. */
+  if (kernel_mprotect(pid, cave, sclen,
+                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    logline("  kernel_mprotect(cave RWX) fallo");
+    return -1;
+  }
+  if (kernel_proc_copyin(pid, sc, cave, sclen) != 0) {
+    logline("  kernel_proc_copyin(stub) fallo");
+    kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_EXEC);
+    return -1;
+  }
+  kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_EXEC);
+  logline("  stub escrito en el cave");
 
-    /* Escribir el trampolin */
-    uint8_t sc[160];
-    size_t sclen = build_shellcode(sc, page, impl_real);
-    if (pt_copyin(pid, sc, page + CODE_OFF, sclen) != 0) {
-      logline("  pt_copyin(shellcode) fallo");
-      pt_munmap(pid, page, PS5_PAGE);
-      break;
-    }
+  /* Repuntar el jmp del thunk hacia el cave (rel32 en thunk+3). */
+  int64_t disp = (int64_t)cave - (int64_t)(thunk + 7);
+  if (disp < INT32_MIN || disp > INT32_MAX) {
+    logline("  cave fuera de rango rel32 -> aborto (no arriesgo)");
+    return -1;
+  }
+  int32_t newrel = (int32_t)disp;
 
-    /* Hacer la pagina ejecutable (y escribible para 'marked') via kernel */
-    if (kernel_mprotect(pid, page, PS5_PAGE,
-                        PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-      logline("  kernel_mprotect(RWX) fallo");
-      pt_munmap(pid, page, PS5_PAGE);
-      break;
-    }
-
-    intptr_t tramp = page + CODE_OFF;
-
-    /* Redirigir el jmp del thunk al trampolin. Reutilizamos el hueco del
-     * jmp rel32 existente: solo reescribimos el rel32 en thunk+3. */
-    int64_t disp = (int64_t)tramp - (int64_t)(thunk + 7);
-    if (disp < INT32_MIN || disp > INT32_MAX) {
-      logline("  trampolin fuera de rango rel32 -> aborto (no arriesgo)");
-      pt_munmap(pid, page, PS5_PAGE);
-      break;
-    }
-    int32_t newrel = (int32_t)disp;
-
-    /* Hacer escribible el texto de libScePad, parchear y restaurar. */
-    int oldprot = kernel_get_vmem_protection(pid, thunk, 8);
-    if (oldprot < 0) {
-      oldprot = PROT_READ | PROT_EXEC;
-    }
-    if (kernel_mprotect(pid, thunk, 8,
-                        PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-      logline("  kernel_mprotect(thunk RWX) fallo");
-      pt_munmap(pid, page, PS5_PAGE);
-      break;
-    }
-    if (kernel_proc_copyin(pid, &newrel, thunk + 3, 4) != 0) {
-      logline("  no pude escribir el parche del thunk");
-      kernel_mprotect(pid, thunk, 8, oldprot);
-      pt_munmap(pid, page, PS5_PAGE);
-      break;
-    }
+  int oldprot = kernel_get_vmem_protection(pid, thunk, 8);
+  if (oldprot < 0) {
+    oldprot = PROT_READ | PROT_EXEC;
+  }
+  if (kernel_mprotect(pid, thunk, 8,
+                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    logline("  kernel_mprotect(thunk RWX) fallo");
+    return -1;
+  }
+  if (kernel_proc_copyin(pid, &newrel, thunk + 3, 4) != 0) {
+    logline("  no pude escribir el parche del thunk");
     kernel_mprotect(pid, thunk, 8, oldprot);
+    return -1;
+  }
+  kernel_mprotect(pid, thunk, 8, oldprot);
 
-    char ok[192];
-    snprintf(ok, sizeof(ok),
-             "  pid=%d (%s): HOOK OK. thunk=0x%lx impl=0x%lx tramp=0x%lx",
-             (int)pid, name, (unsigned long)thunk,
-             (unsigned long)impl_real, (unsigned long)tramp);
-    logline(ok);
-    rc = 1;
-  } while (0);
-
-  pt_detach(pid, 0);
-  return rc;
+  char ok[192];
+  snprintf(ok, sizeof(ok),
+           "  pid=%d (%s): HOOK OK. thunk=0x%lx impl=0x%lx cave=0x%lx",
+           (int)pid, name, (unsigned long)thunk,
+           (unsigned long)impl_real, (unsigned long)cave);
+  logline(ok);
+  return 1;
 }
 
 /* ---- Barrido de procesos ----------------------------------------- */
@@ -342,9 +327,6 @@ scan_and_hook(void) {
     pid_t pid = *(pid_t *)&ptr[KINFO_PID_OFF];
     char *name = (char *)&ptr[KINFO_NAME_OFF];
     ptr += ki_structsize;
-    char dbg[128];
-    snprintf(dbg, sizeof(dbg), "  visto pid=%d name=%s", (int)pid, name);
-    logline(dbg);
 
     if (pid <= 0 || already_hooked(pid) || is_system_proc(name)) {
       continue;
@@ -365,8 +347,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 (hook residente) ===");
-  notify("Activo. Abre el juego; en el, pulsa L1+R1+R3 en el mando roto.");
+  logline("=== LeftStickKiller PASO 2 (Opcion A: sin ptrace, code cave) ===");
+  notify("Activo. Abre el juego con el mando roto; el stick izq. ira al centro.");
 
   /* Daemon residente: vigila nuevos procesos y los engancha al vuelo. */
   for (;;) {
@@ -374,8 +356,7 @@ main(void) {
     if (n > 0) {
       char msg[128];
       snprintf(msg, sizeof(msg),
-               "Hook aplicado en %d proceso(s). L1+R1+R3 centra el stick.",
-               n);
+               "Hook aplicado en %d proceso(s). Stick izquierdo centrado.", n);
       notify(msg);
     }
     sleep(3);
