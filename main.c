@@ -341,6 +341,9 @@ scan_and_hook(void) {
     pid_t pid = *(pid_t *)&ptr[KINFO_PID_OFF];
     char *name = (char *)&ptr[KINFO_NAME_OFF];
     ptr += ki_structsize;
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "  visto pid=%d name=%s", (int)pid, name);
+    logline(dbg);
 
     if (pid <= 0 || already_hooked(pid) || is_system_proc(name)) {
       continue;
