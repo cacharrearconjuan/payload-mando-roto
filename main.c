@@ -231,11 +231,12 @@ hook_pad(pid_t pid, const char *name) {
   intptr_t impl_real = thunk + 7 + rel; /* destino del jmp original */
 
   /* Enganchar el proceso */
+    logline("  -> antes de pt_attach");
   if (pt_attach(pid) != 0) {
     logline("  pt_attach fallo");
     return -1;
   }
-
+  logline("  -> pt_attach OK");
   int rc = -1;
   do {
     /* Reservar pagina para datos + trampolin */
