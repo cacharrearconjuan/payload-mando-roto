@@ -317,18 +317,18 @@ hook_pad(pid_t pid, const char *name) {
 
 static int
 scan_and_hook(void) {
-  int mib[3] = {1, 14, 0}; /* CTL_KERN, KERN_PROC, KERN_PROC_ALL */
+  int mib[4] = {1, 14, 8, 0}; /* CTL_KERN, KERN_PROC, KERN_PROC_PROC */
   size_t buf_size = 0;
   int new_hooks = 0;
 
-  if (sysctl(mib, 3, 0, &buf_size, 0, 0) != 0) {
+  if (sysctl(mib, 4, 0, &buf_size, 0, 0) != 0) {
     return 0;
   }
   uint8_t *buf = malloc(buf_size);
   if (!buf) {
     return 0;
   }
-  if (sysctl(mib, 3, buf, &buf_size, 0, 0) != 0) {
+  if (sysctl(mib, 4, buf, &buf_size, 0, 0) != 0) {
     free(buf);
     return 0;
   }
