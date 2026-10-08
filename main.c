@@ -1,4 +1,4 @@
-/* LeftStickKiller - PASO 2 (v6): hook de lectura del mando con pagina propia
+/* LeftStickKiller - PASO 2 (v7): hook de lectura del mando con pagina propia
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
@@ -6,22 +6,21 @@
  * real y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para
  * el mando (handle) que haya pulsado la combinacion L1+R1+R3.
  *
- * POR QUE v6 (cambio importante respecto a v4/v5):
- *   Las v4/v5 ("SIN ptrace") intentaban escribir el stub en un "code cave"
- *   (una racha de bytes 0xCC) cercano al thunk. Pero en 11.60 los thunks de
- *   libScePad estan pegados cada 16 bytes (7 de codigo + solo 9 de relleno
- *   0xCC), y el stub ocupa ~75-99 bytes. NO EXISTE una racha de 0xCC tan larga
- *   al alcance de un jmp rel32, asi que find_cave_any siempre fallaba
- *   ("sin code cave") y el hook NUNCA se instalaba. Por eso no se activaba nada.
+ * NOVEDADES v7 (respecto a v6, que ya enganchaba el juego):
+ *   1) El menu del sistema (SceShellUI) fallaba al escribir el stub en la
+ *      pagina reservada ("copyin(stub) fallo"): la pagina anonima recien
+ *      mapeada no estaba residente y kernel_proc_copyin no la forzaba. Ahora
+ *      cada escritura usa write_mem(): intenta kernel_proc_copyin y, si falla,
+ *      cae a pt_copyin (ptrace), que corre en el contexto del proceso y si
+ *      fuerza el fallo de pagina. Asi se engancha tambien el menu.
+ *   2) Ya no hace falta repetir el combo en cada juego/proceso: en cuanto el
+ *      daemon detecta que algun stub ha quedado bloqueado (combo pulsado),
+ *      guarda ese handle y PRE-ARMA todos los demas stubs (presentes y
+ *      futuros) con el mismo handle. Pulsas L1+R1+R3 una vez y vale para todo.
  *
- *   v6 vuelve al enfoque del README (PASO 2): se engancha con ptrace, reserva
- *   una pagina entera con pt_mmap (espacio de sobra, sin depender de huecos),
- *   la vuelve RWX con kernel_mprotect, escribe ahi el stub y parchea el thunk
- *   con un salto ABSOLUTO (mov rax,imm64; jmp rax, 12 bytes) que cabe de sobra
- *   en los 16 bytes del thunk y no depende del rango rel32.
- *
- * La logica del stub (combo 0xC04, filtro por handle, centrado) es la misma de
- * la v5, verificada byte a byte. Solo cambia DONDE vive y COMO se salta a el.
+ * v6 ya habia resuelto el problema de fondo: en 11.60 no hay un "code cave"
+ * suficientemente grande cerca del thunk, asi que se reserva una pagina propia
+ * con pt_mmap y se parchea el thunk con un salto absoluto (mov rax; jmp rax).
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev. pt.c/pt.h son de John Tornblom.
  */
@@ -43,6 +42,7 @@
 #define LOG_PATH "/data/LeftStickKiller.log"
 #define PAD_STRIDE 0x78 /* sizeof(ScePadData) = 120 */
 #define STUB_PAGE_SZ 0x4000 /* 16 KiB: tamano de pagina de PS5, de sobra */
+#define NO_HANDLE 0xFFFFFFFFu /* valor "sin bloquear" en locked_handle */
 
 #ifndef MAP_ANONYMOUS
 #ifdef MAP_ANON
@@ -86,17 +86,34 @@ logline(const char *line) {
   }
 }
 
-/* ---- Estado por proceso (idempotencia) -------------------------- */
+/* ---- Escritura robusta en otro proceso --------------------------- */
+/* Intenta la via de kernel y, si falla, la de ptrace (fuerza fallo de
+ * pagina en el contexto del proceso, necesario para el menu). El proceso
+ * debe estar attacheado con ptrace para que pt_copyin funcione. */
+static int
+write_mem(pid_t pid, const void *src, intptr_t dst, size_t len) {
+  if (kernel_proc_copyin(pid, src, dst, len) == 0) return 0;
+  if (pt_copyin(pid, src, dst, len) == 0) return 0;
+  return -1;
+}
+
+/* ---- Estado por proceso (idempotencia + propagacion) ------------- */
 #define MAX_TRIES 3
 
 typedef struct {
   pid_t pid;
   int tries;
   bool done;
+  intptr_t slot[2]; /* direccion de locked_handle: [0]=single [1]=array */
 } pstate_t;
 
 static pstate_t procs[256];
 static int procs_n = 0;
+
+/* Estado global de "armado": una vez pulsado el combo en cualquier proceso,
+ * recordamos el handle para pre-armar el resto. */
+static bool g_armed = false;
+static uint32_t g_handle = NO_HANDLE;
 
 static pstate_t *
 pstate_find(pid_t pid) {
@@ -115,9 +132,8 @@ pstate_get(pid_t pid) {
     return st;
   }
   if (procs_n < (int)(sizeof(procs) / sizeof(procs[0]))) {
+    memset(&procs[procs_n], 0, sizeof(procs[0]));
     procs[procs_n].pid = pid;
-    procs[procs_n].tries = 0;
-    procs[procs_n].done = false;
     return &procs[procs_n++];
   }
   return 0;
@@ -346,8 +362,11 @@ probe_sym(pid_t pid, uint32_t handle, const char *sym) {
 }
 
 /* ---- Hook de una funcion (proceso YA attacheado con ptrace) ------ */
+/* En exito (return 1) deja en *slot_out la direccion de locked_handle. */
 static int
-hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
+hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
+          intptr_t *slot_out) {
+  if (slot_out) *slot_out = 0;
   intptr_t addr = kernel_dynlib_dlsym(pid, handle, sym);
   if (!addr) {
     char l[96];
@@ -399,14 +418,16 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   if (kernel_mprotect(pid, page, STUB_PAGE_SZ,
                       PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo", sym);
+    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo (pagina=0x%lx)",
+             sym, (unsigned long)page);
     logline(l);
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  if (kernel_proc_copyin(pid, sc, page, sclen) != 0) {
+  if (write_mem(pid, sc, page, sclen) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
+    snprintf(l, sizeof(l), "  %s: copyin(stub) fallo (pagina=0x%lx)",
+             sym, (unsigned long)page);
     logline(l);
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
@@ -433,7 +454,7 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  if (kernel_proc_copyin(pid, patch, addr, sizeof(patch)) != 0) {
+  if (write_mem(pid, patch, addr, sizeof(patch)) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
     logline(l);
@@ -442,6 +463,8 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
     return -1;
   }
   kernel_mprotect(pid, addr, sizeof(patch), op);
+
+  if (slot_out) *slot_out = page + (intptr_t)sclen - 4;
 
   char l[192];
   snprintf(l, sizeof(l),
@@ -454,9 +477,11 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
 
 /* ---- Hook en un proceso ------------------------------------------ */
 static int
-hook_pad(pid_t pid, const char *name, bool *failed) {
+hook_pad(pid_t pid, const char *name, bool *failed, intptr_t slots_out[2]) {
   uint32_t handle = 0;
   *failed = false;
+  slots_out[0] = 0;
+  slots_out[1] = 0;
   if (kernel_dynlib_handle(pid, "libScePad.sprx", &handle) != 0 || !handle) {
     return -1;
   }
@@ -485,7 +510,8 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
 
   int fresh = 0;
   for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
-    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array);
+    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array,
+                      &slots_out[i]);
     if (r == 1) fresh++;
     else if (r == -1) *failed = true;
   }
@@ -494,6 +520,48 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
 
   pt_detach(pid, 0);
   return fresh;
+}
+
+/* ---- Propagacion del "armado" entre procesos --------------------- */
+/* Lee los locked_handle de todos los stubs. Si alguno esta bloqueado (combo
+ * pulsado), guarda ese handle como global y lo escribe en el resto de stubs
+ * que aun no esten bloqueados, para no tener que repetir el combo en cada
+ * juego/proceso. Las lecturas no necesitan ptrace; las escrituras son
+ * best-effort (si un proceso no deja escribir, ahi habra que pulsar el combo).
+ */
+static void
+propagate_arm(void) {
+  /* 1) Detectar un combo ya pulsado en cualquier stub. */
+  for (int i = 0; i < procs_n && !g_armed; i++) {
+    for (int k = 0; k < 2; k++) {
+      intptr_t s = procs[i].slot[k];
+      if (!s) continue;
+      uint32_t v = NO_HANDLE;
+      if (kernel_proc_copyout(procs[i].pid, s, &v, 4) == 0 && v != NO_HANDLE) {
+        g_handle = v;
+        g_armed = true;
+        char l[112];
+        snprintf(l, sizeof(l),
+                 "  ARMADO global: handle=%u (pre-armo el resto de procesos)",
+                 (unsigned)v);
+        logline(l);
+        break;
+      }
+    }
+  }
+
+  /* 2) Si estamos armados, pre-armar los stubs que sigan sin bloquear. */
+  if (!g_armed) return;
+  for (int i = 0; i < procs_n; i++) {
+    for (int k = 0; k < 2; k++) {
+      intptr_t s = procs[i].slot[k];
+      if (!s) continue;
+      uint32_t v = NO_HANDLE;
+      if (kernel_proc_copyout(procs[i].pid, s, &v, 4) == 0 && v == NO_HANDLE) {
+        kernel_proc_copyin(procs[i].pid, &g_handle, s, 4); /* best-effort */
+      }
+    }
+  }
 }
 
 /* ---- Barrido de procesos ----------------------------------------- */
@@ -526,10 +594,14 @@ scan_and_hook(void) {
     if (st && st->done) continue;
 
     bool failed = false;
-    int r = hook_pad(pid, name, &failed);
+    intptr_t slots_out[2] = {0, 0};
+    int r = hook_pad(pid, name, &failed, slots_out);
     if (r < 0) continue;
 
     if (!st && !(st = pstate_get(pid))) continue;
+
+    if (slots_out[0]) st->slot[0] = slots_out[0];
+    if (slots_out[1]) st->slot[1] = slots_out[1];
 
     if (r > 0) new_hooks++;
 
@@ -550,11 +622,12 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v6 (pt_mmap + salto absoluto) ===");
-  notify("Activo (v6). Pulsa L1+R1+R3 en el mando roto, dentro del juego o del menu.");
+  logline("=== LeftStickKiller PASO 2 v7 (menu + pre-armado global) ===");
+  notify("Activo (v7). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
 
   for (;;) {
     int n = scan_and_hook();
+    propagate_arm();
     if (n > 0) {
       char msg[128];
       snprintf(msg, sizeof(msg),
@@ -566,3 +639,4 @@ main(void) {
 
   return 0;
 }
+
