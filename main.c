@@ -1,4 +1,4 @@
-/* LeftStickKiller - PASO 2 (v8): hook de lectura del mando con pagina propia
+/* LeftStickKiller - PASO 2 (v9): hook de lectura del mando con pagina propia
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
@@ -6,32 +6,28 @@
  * real y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para
  * el mando (handle) que haya pulsado la combinacion L1+R1+R3.
  *
- * NOVEDAD v8 (CRITICA - arregla crashes y conflictos con otros payloads):
- *   El texto de libScePad.sprx es una pagina FISICA compartida por todos los
- *   procesos. La v7 parcheaba el thunk con kernel_proc_copyin, que escribe en
- *   esa pagina compartida saltandose el copy-on-write: el salto absoluto a la
- *   pagina del stub (que solo existe en UN proceso) aparecia en el thunk de
- *   TODOS los procesos. Los demas saltaban a una direccion no mapeada en su
- *   espacio -> crash / conflictos. v8 escribe el parche del thunk con pt_copyin
- *   (ptrace -> proc_rwmem), que provoca copy-on-write y deja el parche PRIVADO
- *   de cada proceso: cada uno apunta a su propia pagina. (El stub, en memoria
- *   anonima privada, se sigue escribiendo con write_mem, que no comparte nada.)
+ * NOVEDAD v9 (CRITICA - arregla el CUELGUE de la v8):
+ *   La v8 parcheaba el thunk con pt_copyin directo, creyendo que kernel_proc_copyin
+ *   contaminaria el texto COMPARTIDO de libScePad. En la practica:
+ *     - pt_copyin SOBRE EL THUNK (texto compartido/wired) CUELGA el payload
+ *       (proc_rwmem se atasca). El log moria justo tras volcar los bytes, sin
+ *       HOOK OK ni error, con el juego congelado (attacheado y sin pt_detach).
+ *     - kernel_proc_copyin sobre el thunk YA FUNCIONABA en la v6 (HOOK OK) y NO
+ *       crasheaba el resto del sistema, luego respeta el mapeo por proceso.
+ *   v9: el thunk se vuelve a escribir con kernel_proc_copyin (via llamada
+ *   directa) y NUNCA con pt_copyin. El stub (pagina anonima PRIVADA) se sigue
+ *   escribiendo con write_mem (kernel y, si falla, pt_copyin), que ahi es seguro.
  *
  * NOVEDADES v7 (respecto a v6, que ya enganchaba el juego):
- *   1) El menu del sistema (SceShellUI) fallaba al escribir el stub en la
- *      pagina reservada ("copyin(stub) fallo"): la pagina anonima recien
- *      mapeada no estaba residente y kernel_proc_copyin no la forzaba. Ahora
- *      cada escritura usa write_mem(): intenta kernel_proc_copyin y, si falla,
- *      cae a pt_copyin (ptrace), que corre en el contexto del proceso y si
- *      fuerza el fallo de pagina. Asi se engancha tambien el menu.
- *   2) Ya no hace falta repetir el combo en cada juego/proceso: en cuanto el
- *      daemon detecta que algun stub ha quedado bloqueado (combo pulsado),
- *      guarda ese handle y PRE-ARMA todos los demas stubs (presentes y
- *      futuros) con el mismo handle. Pulsas L1+R1+R3 una vez y vale para todo.
+ *   1) El menu (SceShellUI) fallaba al escribir el stub ("copyin(stub) fallo"):
+ *      la pagina anonima recien mapeada no estaba residente. write_mem cae a
+ *      pt_copyin, que fuerza el fallo de pagina en el contexto del proceso.
+ *   2) Pre-armado global: en cuanto un stub queda bloqueado (combo pulsado), se
+ *      guarda ese handle y se pre-arman los demas. Pulsas L1+R1+R3 una vez.
  *
- * v6 ya habia resuelto el problema de fondo: en 11.60 no hay un "code cave"
- * suficientemente grande cerca del thunk, asi que se reserva una pagina propia
- * con pt_mmap y se parchea el thunk con un salto absoluto (mov rax; jmp rax).
+ * v6 resolvio el problema de fondo: en 11.60 no hay un "code cave" grande cerca
+ * del thunk, asi que se reserva una pagina propia con pt_mmap y se parchea el
+ * thunk con un salto absoluto (mov rax; jmp rax).
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev. pt.c/pt.h son de John Tornblom.
  */
@@ -97,13 +93,12 @@ logline(const char *line) {
   }
 }
 
-/* ---- Escritura robusta en otro proceso --------------------------- */
-/* Intenta la via de kernel y, si falla, la de ptrace (fuerza fallo de
- * pagina en el contexto del proceso, necesario para el menu). El proceso
- * debe estar attacheado con ptrace para que pt_copyin funcione.
- * OJO: solo para memoria PRIVADA del proceso (p.ej. la pagina anonima del
- * stub). Para el thunk, que esta en texto COMPARTIDO, NO uses write_mem:
- * usa pt_copyin directamente para forzar copy-on-write (ver hook_func). */
+/* ---- Escritura robusta en memoria PRIVADA de otro proceso -------- */
+/* Intenta la via de kernel y, si falla, la de ptrace (fuerza fallo de pagina
+ * en el contexto del proceso; necesario para la pagina anonima del stub en el
+ * menu). SOLO para memoria privada del proceso. Para el thunk (texto
+ * COMPARTIDO) NO se usa esto: pt_copyin sobre texto compartido cuelga, asi que
+ * el thunk se escribe con kernel_proc_copyin a secas (ver hook_func). */
 static int
 write_mem(pid_t pid, const void *src, intptr_t dst, size_t len) {
   if (kernel_proc_copyin(pid, src, dst, len) == 0) return 0;
@@ -420,7 +415,7 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  /* Reserva una pagina propia en el proceso (via ptrace) y hazla RWX. */
+  /* Reserva una pagina propia (anonima, PRIVADA) en el proceso y hazla RWX. */
   intptr_t page = pt_mmap(pid, 0, STUB_PAGE_SZ, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (page == -1 || page < 0x1000) {
@@ -438,6 +433,8 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
+  /* El stub va en memoria anonima PRIVADA: write_mem (kernel y, si falla, el
+   * fallback pt_copyin que fuerza el fallo de pagina) es seguro aqui. */
   if (write_mem(pid, sc, page, sclen) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(stub) fallo (pagina=0x%lx)",
@@ -468,16 +465,13 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  /* IMPORTANTE: el thunk esta en el TEXTO de libScePad, que es una pagina
-   * FISICA compartida por todos los procesos. Hay que escribir el parche con
-   * pt_copyin (ptrace): pasa por proc_rwmem, que provoca copy-on-write y deja
-   * el parche PRIVADO de este proceso. Con kernel_proc_copyin la escritura iria
-   * a la pagina compartida y contaminaria a los demas procesos (saltarian a una
-   * pagina que no existe en su espacio -> crash y conflictos con otros payloads).
-   * Por eso aqui NO se usa write_mem (que probaria antes la via de kernel). */
-  if (pt_copyin(pid, patch, addr, sizeof(patch)) != 0) {
+  /* IMPORTANTE (v9): el thunk esta en el TEXTO de libScePad. Se escribe con
+   * kernel_proc_copyin A SECAS. NO usar pt_copyin aqui: pt_copyin/proc_rwmem
+   * sobre esa pagina compartida/wired CUELGA el payload (fue el bug de la v8).
+   * kernel_proc_copyin ya funcionaba en la v6 y respeta el mapeo por proceso. */
+  if (kernel_proc_copyin(pid, patch, addr, sizeof(patch)) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: pt_copyin(parche thunk) fallo", sym);
+    snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
     logline(l);
     kernel_mprotect(pid, addr, sizeof(patch), op);
     pt_munmap(pid, page, STUB_PAGE_SZ);
@@ -642,8 +636,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v8 (parche privado por proceso) ===");
-  notify("Activo (v8). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
+  logline("=== LeftStickKiller PASO 2 v9 (arregla el cuelgue de la v8) ===");
+  notify("Activo (v9). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
 
   for (;;) {
     int n = scan_and_hook();
