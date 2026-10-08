@@ -392,8 +392,10 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
   /* Reserva una pagina propia en el proceso (via ptrace) y hazla RWX. */
+  logline("  paso1: antes de pt_mmap");
   intptr_t page = pt_mmap(pid, 0, STUB_PAGE_SZ, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  logline("  paso2: pt_mmap OK");
   if (page == -1 || page < 0x1000) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: pt_mmap fallo (errno=%d)", sym, pt_errno(pid));
@@ -408,6 +410,7 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
+  logline("  paso3: antes de copyin stub");
   if (kernel_proc_copyin(pid, sc, page, sclen) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
