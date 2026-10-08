@@ -1,10 +1,14 @@
-/* LeftStickKiller - PASO 2 (Opcion A, v4): hook de lectura del mando SIN ptrace
+/* LeftStickKiller - PASO 2 (Opcion A, v5): hook de lectura del mando SIN ptrace
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
  * lectura del mando en el proceso del juego y menú, deja pasar la lectura real
  * y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para el
  * mando (handle) que haya pulsado la combinación L1+R1+R3.
+ *
+ * v5: Se utiliza una máscara de bits (AND 0xC04) para permitir que el combo
+ * active la fijación incluso si otros botones están pulsados simultáneamente.
+ * Se restauran los mensajes de log exhaustivos para diagnosticar problemas.
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev.
  */
@@ -95,7 +99,6 @@ pstate_get(pid_t pid) {
   return 0;
 }
 
-/* Se elimina SceShellUI de esta lista para poder enganchar el menú del sistema */
 static bool
 is_system_proc(const char *name) {
   return !strcmp(name, "SceShellCore") ||
@@ -185,8 +188,8 @@ parse_thunk(pid_t pid, intptr_t addr, const uint8_t *h, thunk_t *t) {
 
 /* ---- Stubs (shellcode x86-64) ------------------------------------ */
 /*
- * Se guardan rbx (array), r12 (handle) y r13 (alineación) para preservar la ABI
- * al llamar a la implementación real. El handle sobrevive la llamada en r12.
+ * Se guardan rbx (array), r12 (handle) y r13 (alineación) para preservar la ABI.
+ * Se usa (buttons AND 0xC04) == 0xC04 para permitir combos laxos.
  */
 static const uint8_t stub_hdr[] = {
   0x53,                         /* push rbx                */
@@ -199,13 +202,17 @@ static const uint8_t stub_hdr[] = {
 
 static const uint8_t stub_single_tail[] = {
   0xFF, 0xD0,                               /* call rax                */
-  0x81, 0x3B, 0x04, 0x0C, 0x00, 0x00,       /* cmp dword [rbx], 0xC04  */
-  0x75, 0x07,                               /* jne +7                  */
+  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
+  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
+  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
+  0x75, 0x07,                               /* jne skip_lock (+7)      */
   0x44, 0x89, 0x25, 0x17, 0x00, 0x00, 0x00, /* mov dword [rip+0x17], r12d */
+  /* skip_lock: */
   0x44, 0x3B, 0x25, 0x10, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x10] */
-  0x75, 0x08,                               /* jne +8                  */
+  0x75, 0x08,                               /* jne done (+8)           */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
+  /* done: */
   0x41, 0x5D,                               /* pop r13                 */
   0x41, 0x5C,                               /* pop r12                 */
   0x5B,                                     /* pop rbx                 */
@@ -220,18 +227,22 @@ static const uint8_t stub_array_tail[] = {
   0x7E, 0x05,                               /* jle +5                  */
   0xB8, 0x40, 0x00, 0x00, 0x00,             /* mov eax, 64             */
   0x85, 0xC0,                               /* test eax, eax           */
-  0x7E, 0x28,                               /* jle +0x28               */
+  0x7E, 0x30,                               /* jle +0x30 (done_loop)   */
   /* loop_start: */
-  0x81, 0x3B, 0x04, 0x0C, 0x00, 0x00,       /* cmp dword [rbx], 0xC04  */
-  0x75, 0x07,                               /* jne +7                  */
+  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
+  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
+  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
+  0x75, 0x07,                               /* jne skip_lock (+7)      */
   0x44, 0x89, 0x25, 0x20, 0x00, 0x00, 0x00, /* mov dword [rip+0x20], r12d */
+  /* skip_lock: */
   0x44, 0x3B, 0x25, 0x19, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x19] */
-  0x75, 0x08,                               /* jne +8                  */
+  0x75, 0x08,                               /* jne next_iter (+8)      */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
+  /* next_iter: */
   0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           */
   0xFF, 0xC8,                               /* dec eax                 */
-  0x75, 0xD8,                               /* jnz -0x28 (loop_start)  */
+  0x75, 0xD0,                               /* jnz -0x30 (loop_start)  */
   /* done_loop: */
   0x58,                                     /* pop rax                 */
   0x41, 0x5D,                               /* pop r13                 */
@@ -241,7 +252,7 @@ static const uint8_t stub_array_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-#define STUB_MAX (MAX_PRO + sizeof(stub_hdr) + 8 + sizeof(stub_array_tail))
+#define STUB_MAX 128
 
 static size_t
 build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, bool is_array) {
@@ -351,44 +362,91 @@ static int
 hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
           const char *sym, bool is_array) {
   intptr_t addr = kernel_dynlib_dlsym(pid, handle, sym);
-  if (!addr) return 0;
+  if (!addr) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: no exportado", sym);
+    logline(l);
+    return 0;
+  }
 
   uint8_t h[MAX_PRO + 8];
-  if (kernel_proc_copyout(pid, addr, h, sizeof(h)) != 0) return -1;
+  if (kernel_proc_copyout(pid, addr, h, sizeof(h)) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s @0x%lx: no pude leer", sym, (unsigned long)addr);
+    logline(l);
+    return -1;
+  }
+  log_bytes(sym, addr, h);
 
   thunk_t t;
-  if (!parse_thunk(pid, addr, h, &t)) return -1;
+  if (!parse_thunk(pid, addr, h, &t)) {
+    char l[128];
+    snprintf(l, sizeof(l),
+             "  %s: forma no manejable (no es prologo+jmp) -> solo dump", sym);
+    logline(l);
+    return -1;
+  }
 
   intptr_t impl = 0;
-  if (is_our_stub(pid, &t, &impl)) return 2;
+  if (is_our_stub(pid, &t, &impl)) {
+    char l[192];
+    snprintf(l, sizeof(l), "  %s: ya enganchado (stub=0x%lx impl=0x%lx)",
+             sym, (unsigned long)t.target, (unsigned long)impl);
+    logline(l);
+    return 2;
+  }
   impl = t.target;
 
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
   intptr_t cave = find_cave_any(pid, mapbase, sclen, addr, t.kind == 1);
-  if (!cave) return -1;
-
-  if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+  if (!cave) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen);
+    logline(l);
     return -1;
+  }
+
+  if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo", sym);
+    logline(l);
+    return -1;
+  }
   
   if (kernel_proc_copyin(pid, sc, cave, sclen) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
+    logline(l);
     kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_EXEC);
     return -1;
   }
   
-  /* NOTA: Se deja PROT_WRITE intencionalmente para que el stub pueda escribir en locked_handle */
   kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC);
 
   if (t.kind == 1) {
     int64_t disp = (int64_t)cave - (int64_t)(addr + t.instr_end);
-    if (disp < INT32_MIN || disp > INT32_MAX) return -1;
+    if (disp < INT32_MIN || disp > INT32_MAX) {
+      char l[96];
+      snprintf(l, sizeof(l), "  %s: cave fuera de rango rel32", sym);
+      logline(l);
+      return -1;
+    }
     int32_t nr = (int32_t)disp;
     size_t plen = (size_t)t.instr_end;
     int op = kernel_get_vmem_protection(pid, addr, plen);
     if (op < 0) op = PROT_READ | PROT_EXEC;
-    if (kernel_mprotect(pid, addr, plen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return -1;
+    if (kernel_mprotect(pid, addr, plen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      char l[96];
+      snprintf(l, sizeof(l), "  %s: mprotect(thunk) fallo", sym);
+      logline(l);
+      return -1;
+    }
     if (kernel_proc_copyin(pid, &nr, addr + t.rel_off, 4) != 0) {
+      char l[96];
+      snprintf(l, sizeof(l), "  %s: copyin(rel32) fallo", sym);
+      logline(l);
       kernel_mprotect(pid, addr, plen, op);
       return -1;
     }
@@ -396,13 +454,28 @@ hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
   } else {
     int op = kernel_get_vmem_protection(pid, t.slot, 8);
     if (op < 0) op = PROT_READ | PROT_WRITE;
-    if (kernel_mprotect(pid, t.slot, 8, PROT_READ | PROT_WRITE) != 0) return -1;
+    if (kernel_mprotect(pid, t.slot, 8, PROT_READ | PROT_WRITE) != 0) {
+      char l[96];
+      snprintf(l, sizeof(l), "  %s: mprotect(slot) fallo", sym);
+      logline(l);
+      return -1;
+    }
     if (kernel_proc_copyin(pid, &cave, t.slot, 8) != 0) {
+      char l[96];
+      snprintf(l, sizeof(l), "  %s: copyin(slot) fallo", sym);
+      logline(l);
       kernel_mprotect(pid, t.slot, 8, op);
       return -1;
     }
     kernel_mprotect(pid, t.slot, 8, op);
   }
+
+  char l[192];
+  snprintf(l, sizeof(l),
+           "  %s: HOOK OK (%s) prologo=%dB impl=0x%lx cave=0x%lx len=%u",
+           sym, is_array ? "array" : "single", t.pro_len,
+           (unsigned long)impl, (unsigned long)cave, (unsigned)sclen);
+  logline(l);
   return 1;
 }
 
@@ -415,6 +488,11 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
     return -1;
   }
   intptr_t mapbase = kernel_dynlib_mapbase_addr(pid, handle);
+
+  char m[160];
+  snprintf(m, sizeof(m), "  pid=%d (%s): libScePad handle=%u mapbase=0x%lx",
+           (int)pid, name, (unsigned)handle, (unsigned long)mapbase);
+  logline(m);
 
   static const struct {
     const char *sym;
@@ -476,6 +554,10 @@ scan_and_hook(void) {
       st->done = true;
     } else if (++st->tries >= MAX_TRIES) {
       st->done = true;
+      char l[96];
+      snprintf(l, sizeof(l), "  pid=%d: fallos tras %d intentos, lo dejo",
+               (int)pid, st->tries);
+      logline(l);
     }
   }
 
@@ -485,8 +567,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v4 (Filtro por Handle y soporte SceShellUI) ===");
-  notify("Activo. Ya funciona en juego y menú (L1+R1+R3 para centrar el mando roto).");
+  logline("=== LeftStickKiller PASO 2 v5 (AND logic + verbose logs) ===");
+  notify("Activo (v5). Pulsa L1+R1+R3 en el mando roto.");
 
   for (;;) {
     int n = scan_and_hook();
