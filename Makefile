@@ -23,8 +23,9 @@ ELF := LeftStickKiller.elf
 CFLAGS := -Wall -O2
 LDADD  := -lSceNotification
 
-# Opcion A: ya no se usa ptrace, asi que no compilamos pt.o.
-OBJS := main.o
+# v6: volvemos a ptrace (pt_mmap reserva la pagina del stub), asi que
+# compilamos pt.o junto a main.o.
+OBJS := main.o pt.o
 
 all: $(ELF)
 
