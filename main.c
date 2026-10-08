@@ -1,10 +1,21 @@
-/* LeftStickKiller - PASO 2 (v7): hook de lectura del mando con pagina propia
+/* LeftStickKiller - PASO 2 (v8): hook de lectura del mando con pagina propia
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
  * lectura del mando en el proceso del juego y del menu, deja pasar la lectura
  * real y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para
  * el mando (handle) que haya pulsado la combinacion L1+R1+R3.
+ *
+ * NOVEDAD v8 (CRITICA - arregla crashes y conflictos con otros payloads):
+ *   El texto de libScePad.sprx es una pagina FISICA compartida por todos los
+ *   procesos. La v7 parcheaba el thunk con kernel_proc_copyin, que escribe en
+ *   esa pagina compartida saltandose el copy-on-write: el salto absoluto a la
+ *   pagina del stub (que solo existe en UN proceso) aparecia en el thunk de
+ *   TODOS los procesos. Los demas saltaban a una direccion no mapeada en su
+ *   espacio -> crash / conflictos. v8 escribe el parche del thunk con pt_copyin
+ *   (ptrace -> proc_rwmem), que provoca copy-on-write y deja el parche PRIVADO
+ *   de cada proceso: cada uno apunta a su propia pagina. (El stub, en memoria
+ *   anonima privada, se sigue escribiendo con write_mem, que no comparte nada.)
  *
  * NOVEDADES v7 (respecto a v6, que ya enganchaba el juego):
  *   1) El menu del sistema (SceShellUI) fallaba al escribir el stub en la
@@ -89,7 +100,10 @@ logline(const char *line) {
 /* ---- Escritura robusta en otro proceso --------------------------- */
 /* Intenta la via de kernel y, si falla, la de ptrace (fuerza fallo de
  * pagina en el contexto del proceso, necesario para el menu). El proceso
- * debe estar attacheado con ptrace para que pt_copyin funcione. */
+ * debe estar attacheado con ptrace para que pt_copyin funcione.
+ * OJO: solo para memoria PRIVADA del proceso (p.ej. la pagina anonima del
+ * stub). Para el thunk, que esta en texto COMPARTIDO, NO uses write_mem:
+ * usa pt_copyin directamente para forzar copy-on-write (ver hook_func). */
 static int
 write_mem(pid_t pid, const void *src, intptr_t dst, size_t len) {
   if (kernel_proc_copyin(pid, src, dst, len) == 0) return 0;
@@ -454,9 +468,16 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  if (write_mem(pid, patch, addr, sizeof(patch)) != 0) {
+  /* IMPORTANTE: el thunk esta en el TEXTO de libScePad, que es una pagina
+   * FISICA compartida por todos los procesos. Hay que escribir el parche con
+   * pt_copyin (ptrace): pasa por proc_rwmem, que provoca copy-on-write y deja
+   * el parche PRIVADO de este proceso. Con kernel_proc_copyin la escritura iria
+   * a la pagina compartida y contaminaria a los demas procesos (saltarian a una
+   * pagina que no existe en su espacio -> crash y conflictos con otros payloads).
+   * Por eso aqui NO se usa write_mem (que probaria antes la via de kernel). */
+  if (pt_copyin(pid, patch, addr, sizeof(patch)) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
+    snprintf(l, sizeof(l), "  %s: pt_copyin(parche thunk) fallo", sym);
     logline(l);
     kernel_mprotect(pid, addr, sizeof(patch), op);
     pt_munmap(pid, page, STUB_PAGE_SZ);
@@ -526,9 +547,8 @@ hook_pad(pid_t pid, const char *name, bool *failed, intptr_t slots_out[2]) {
 /* Lee los locked_handle de todos los stubs. Si alguno esta bloqueado (combo
  * pulsado), guarda ese handle como global y lo escribe en el resto de stubs
  * que aun no esten bloqueados, para no tener que repetir el combo en cada
- * juego/proceso. Las lecturas no necesitan ptrace; las escrituras son
- * best-effort (si un proceso no deja escribir, ahi habra que pulsar el combo).
- */
+ * juego/proceso. Escribe en la pagina anonima PRIVADA del stub (no en texto
+ * compartido), asi que kernel_proc_copyin aqui es seguro y best-effort. */
 static void
 propagate_arm(void) {
   /* 1) Detectar un combo ya pulsado en cualquier stub. */
@@ -622,8 +642,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v7 (menu + pre-armado global) ===");
-  notify("Activo (v7). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
+  logline("=== LeftStickKiller PASO 2 v8 (parche privado por proceso) ===");
+  notify("Activo (v8). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
 
   for (;;) {
     int n = scan_and_hook();
@@ -639,4 +659,3 @@ main(void) {
 
   return 0;
 }
-
