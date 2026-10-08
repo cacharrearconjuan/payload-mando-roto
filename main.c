@@ -221,12 +221,10 @@ static const uint8_t stub_single_tail[] = {
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
   0x75, 0x07,                               /* jne skip_lock (+7)      */
   0x44, 0x89, 0x25, 0x17, 0x00, 0x00, 0x00, /* mov dword [rip+0x17], r12d */
-  /* skip_lock: */
   0x44, 0x3B, 0x25, 0x10, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x10] */
   0x75, 0x08,                               /* jne done (+8)           */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
-  /* done: */
   0x41, 0x5D,                               /* pop r13                 */
   0x41, 0x5C,                               /* pop r12                 */
   0x5B,                                     /* pop rbx                 */
@@ -242,22 +240,18 @@ static const uint8_t stub_array_tail[] = {
   0xB8, 0x40, 0x00, 0x00, 0x00,             /* mov eax, 64             */
   0x85, 0xC0,                               /* test eax, eax           */
   0x7E, 0x30,                               /* jle +0x30 (done_loop)   */
-  /* loop_start: */
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
   0x75, 0x07,                               /* jne skip_lock (+7)      */
   0x44, 0x89, 0x25, 0x20, 0x00, 0x00, 0x00, /* mov dword [rip+0x20], r12d */
-  /* skip_lock: */
   0x44, 0x3B, 0x25, 0x19, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x19] */
   0x75, 0x08,                               /* jne next_iter (+8)      */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
-  /* next_iter: */
   0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           */
   0xFF, 0xC8,                               /* dec eax                 */
   0x75, 0xD0,                               /* jnz -0x30 (loop_start)  */
-  /* done_loop: */
   0x58,                                     /* pop rax                 */
   0x41, 0x5D,                               /* pop r13                 */
   0x41, 0x5C,                               /* pop r12                 */
@@ -311,8 +305,6 @@ find_code_cave(pid_t pid, intptr_t start, size_t need) {
 
   for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
     if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
-      /* pagina no mapeada: saltamosla pero seguimos (el modulo puede tener
-       * huecos); reiniciamos la racha. */
       run_len = 0;
       continue;
     }
@@ -329,7 +321,6 @@ find_code_cave(pid_t pid, intptr_t start, size_t need) {
   return 0;
 }
 
-/* Como el salto al cave es ABSOLUTO, el cave puede estar en CUALQUIER modulo. */
 static intptr_t
 find_cave_any(pid_t pid, intptr_t mapbase, size_t need) {
   static const char *libs[] = {
@@ -409,7 +400,6 @@ hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  /* Busca un code cave (racha de 0xCC) de al menos sclen bytes. SIN ptrace. */
   logline("  paso1: buscando code cave (sin ptrace)");
   intptr_t cave = find_cave_any(pid, mapbase, sclen);
   if (!cave) {
@@ -439,13 +429,9 @@ hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
     kernel_mprotect(pid, cave, sclen, cp);
     return -1;
   }
-  /* el stub escribe locked_handle en runtime -> dejar la pagina escribible */
   kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC);
   logline("  paso3: stub escrito en el cave");
 
-  /* Parchea el thunk con un salto absoluto al cave:
-   *   48 B8 <cave:8>   mov rax, cave
-   *   FF E0            jmp rax   (12 bytes, caben en los 16 del thunk) */
   uint8_t patch[12];
   patch[0] = 0x48;
   patch[1] = 0xB8;
