@@ -1,16 +1,29 @@
-/* LeftStickKiller - PASO 2 (Opcion A, v5): hook de lectura del mando SIN ptrace
+/* LeftStickKiller - PASO 2 (v6): hook de lectura del mando con pagina propia
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
- * lectura del mando en el proceso del juego y menú, deja pasar la lectura real
- * y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para el
- * mando (handle) que haya pulsado la combinación L1+R1+R3.
+ * lectura del mando en el proceso del juego y del menu, deja pasar la lectura
+ * real y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para
+ * el mando (handle) que haya pulsado la combinacion L1+R1+R3.
  *
- * v5: Se utiliza una máscara de bits (AND 0xC04) para permitir que el combo
- * active la fijación incluso si otros botones están pulsados simultáneamente.
- * Se restauran los mensajes de log exhaustivos para diagnosticar problemas.
+ * POR QUE v6 (cambio importante respecto a v4/v5):
+ *   Las v4/v5 ("SIN ptrace") intentaban escribir el stub en un "code cave"
+ *   (una racha de bytes 0xCC) cercano al thunk. Pero en 11.60 los thunks de
+ *   libScePad estan pegados cada 16 bytes (7 de codigo + solo 9 de relleno
+ *   0xCC), y el stub ocupa ~75-99 bytes. NO EXISTE una racha de 0xCC tan larga
+ *   al alcance de un jmp rel32, asi que find_cave_any siempre fallaba
+ *   ("sin code cave") y el hook NUNCA se instalaba. Por eso no se activaba nada.
  *
- * Licencia: GPLv3+. Ecosistema ps5-payload-dev.
+ *   v6 vuelve al enfoque del README (PASO 2): se engancha con ptrace, reserva
+ *   una pagina entera con pt_mmap (espacio de sobra, sin depender de huecos),
+ *   la vuelve RWX con kernel_mprotect, escribe ahi el stub y parchea el thunk
+ *   con un salto ABSOLUTO (mov rax,imm64; jmp rax, 12 bytes) que cabe de sobra
+ *   en los 16 bytes del thunk y no depende del rango rel32.
+ *
+ * La logica del stub (combo 0xC04, filtro por handle, centrado) es la misma de
+ * la v5, verificada byte a byte. Solo cambia DONDE vive y COMO se salta a el.
+ *
+ * Licencia: GPLv3+. Ecosistema ps5-payload-dev. pt.c/pt.h son de John Tornblom.
  */
 
 #include <ps5/kernel.h>
@@ -25,8 +38,19 @@
 #include <sys/sysctl.h>
 #include <sys/mman.h>
 
+#include "pt.h"
+
 #define LOG_PATH "/data/LeftStickKiller.log"
 #define PAD_STRIDE 0x78 /* sizeof(ScePadData) = 120 */
+#define STUB_PAGE_SZ 0x4000 /* 16 KiB: tamano de pagina de PS5, de sobra */
+
+#ifndef MAP_ANONYMOUS
+#ifdef MAP_ANON
+#define MAP_ANONYMOUS MAP_ANON
+#else
+#define MAP_ANONYMOUS 0x1000
+#endif
+#endif
 
 /* ---- Aviso en pantalla (libSceNotification) ---------------------- */
 
@@ -99,6 +123,7 @@ pstate_get(pid_t pid) {
   return 0;
 }
 
+/* SceShellUI NO esta en la lista, para poder enganchar el menu del sistema. */
 static bool
 is_system_proc(const char *name) {
   return !strcmp(name, "SceShellCore") ||
@@ -188,9 +213,25 @@ parse_thunk(pid_t pid, intptr_t addr, const uint8_t *h, thunk_t *t) {
 
 /* ---- Stubs (shellcode x86-64) ------------------------------------ */
 /*
- * Se guardan rbx (array), r12 (handle) y r13 (alineación) para preservar la ABI.
- * Se usa (buttons AND 0xC04) == 0xC04 para permitir combos laxos.
+ * Layout del stub en la pagina reservada:
+ *   [endbr64] [prologo original] [stub_hdr] [impl:imm64] [tail]
+ *
+ * endbr64 va delante porque al stub saltamos con un salto INDIRECTO
+ * (jmp rax); si el firmware fuerza CET/IBT, el destino de un salto indirecto
+ * debe empezar por endbr64. Si no lo fuerza, endbr64 es un NOP: inofensivo.
+ *
+ * Se guardan rbx (array de datos) y r12 (handle) para que sobrevivan a la
+ * llamada a la implementacion real; r13 es un tercer push solo para dejar la
+ * pila alineada a 16 antes del call. (buttons AND 0xC04) == 0xC04 detecta el
+ * combo L1+R1+R3 aunque haya otros botones pulsados.
+ *
+ * Los desplazamientos rip-relativos del tail (0x17/0x10 y 0x20/0x19) son
+ * internos al propio tail, asi que no cambian al anteponer endbr64/prologo.
  */
+static const uint8_t endbr64_pre[] = {
+  0xF3, 0x0F, 0x1E, 0xFA,       /* endbr64                 */
+};
+
 static const uint8_t stub_hdr[] = {
   0x53,                         /* push rbx                */
   0x41, 0x54,                   /* push r12                */
@@ -252,11 +293,14 @@ static const uint8_t stub_array_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-#define STUB_MAX 128
+#define STUB_MAX (sizeof(endbr64_pre) + MAX_PRO + sizeof(stub_hdr) + 8 + \
+                  sizeof(stub_array_tail))
 
 static size_t
 build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, bool is_array) {
   size_t n = 0;
+  memcpy(sc + n, endbr64_pre, sizeof(endbr64_pre));
+  n += sizeof(endbr64_pre);
   memcpy(sc + n, t->pro, t->pro_len);
   n += t->pro_len;
   memcpy(sc + n, stub_hdr, sizeof(stub_hdr));
@@ -273,70 +317,14 @@ build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, bool is_array) {
   return n;
 }
 
+/* Un thunk ya enganchado empieza por nuestro parche: 48 B8 <page> FF E0 */
 static bool
-is_our_stub(pid_t pid, const thunk_t *t, intptr_t *real_impl) {
-  uint8_t b[MAX_PRO + sizeof(stub_hdr) + 8];
-  size_t n = t->pro_len + sizeof(stub_hdr) + 8;
-  if (kernel_proc_copyout(pid, t->target, b, n) != 0) return false;
-  if (memcmp(b, t->pro, t->pro_len) != 0 ||
-      memcmp(b + t->pro_len, stub_hdr, sizeof(stub_hdr)) != 0) {
-    return false;
+is_hooked_thunk(const uint8_t *h, intptr_t *page_out) {
+  if (h[0] == 0x48 && h[1] == 0xB8 && h[10] == 0xFF && h[11] == 0xE0) {
+    memcpy(page_out, h + 2, 8);
+    return true;
   }
-  memcpy(real_impl, b + t->pro_len + sizeof(stub_hdr), 8);
-  return true;
-}
-
-/* ---- Busqueda de code cave (racha de 0xCC) ----------------------- */
-static bool
-in_rel32(intptr_t a, intptr_t near) {
-  int64_t d = (int64_t)a - (int64_t)near;
-  return d > -0x7FFF0000LL && d < 0x7FFF0000LL;
-}
-
-static intptr_t
-find_code_cave(pid_t pid, intptr_t start, size_t need,
-               intptr_t near, bool need_rel32) {
-  uint8_t chunk[0x1000];
-  intptr_t run_start = 0;
-  size_t run_len = 0;
-  intptr_t addr = start & ~((intptr_t)0xFFF);
-  intptr_t limit = addr + 0x600000;
-
-  if (need_rel32 && !in_rel32(addr, near)) return 0;
-  for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
-    if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) break;
-    for (size_t i = 0; i < sizeof(chunk); i++) {
-      if (chunk[i] == 0xCC) {
-        if (run_len == 0) run_start = addr + (intptr_t)i;
-        run_len++;
-        if (run_len >= need &&
-            (!need_rel32 || in_rel32(run_start + (intptr_t)need, near))) {
-          return run_start;
-        }
-      } else {
-        run_len = 0;
-      }
-    }
-  }
-  return 0;
-}
-
-static intptr_t
-find_cave_any(pid_t pid, intptr_t mapbase, size_t need,
-              intptr_t near, bool need_rel32) {
-  static const char *libs[] = {
-    "libkernel.sprx", "libkernel_web.sprx", "libkernel_sys.sprx",
-    "libSceLibcInternal.sprx", "libc.sprx",
-  };
-  intptr_t cave = 0;
-  if (mapbase > 0) cave = find_code_cave(pid, mapbase, need, near, need_rel32);
-  for (size_t i = 0; !cave && i < sizeof(libs) / sizeof(libs[0]); i++) {
-    uint32_t h = 0;
-    if (kernel_dynlib_handle(pid, libs[i], &h) != 0 || !h) continue;
-    intptr_t base = kernel_dynlib_mapbase_addr(pid, h);
-    if (base > 0) cave = find_code_cave(pid, base, need, near, need_rel32);
-  }
-  return cave;
+  return false;
 }
 
 /* ---- Diagnostico ------------------------------------------------- */
@@ -357,10 +345,9 @@ probe_sym(pid_t pid, uint32_t handle, const char *sym) {
   if (kernel_proc_copyout(pid, a, b, sizeof(b)) == 0) log_bytes(sym, a, b);
 }
 
-/* ---- Hook de una funcion ----------------------------------------- */
+/* ---- Hook de una funcion (proceso YA attacheado con ptrace) ------ */
 static int
-hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
-          const char *sym, bool is_array) {
+hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   intptr_t addr = kernel_dynlib_dlsym(pid, handle, sym);
   if (!addr) {
     char l[96];
@@ -378,6 +365,15 @@ hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
   }
   log_bytes(sym, addr, h);
 
+  intptr_t hooked_page = 0;
+  if (is_hooked_thunk(h, &hooked_page)) {
+    char l[128];
+    snprintf(l, sizeof(l), "  %s: ya enganchado (pagina=0x%lx)",
+             sym, (unsigned long)hooked_page);
+    logline(l);
+    return 2;
+  }
+
   thunk_t t;
   if (!parse_thunk(pid, addr, h, &t)) {
     char l[128];
@@ -386,95 +382,72 @@ hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
     logline(l);
     return -1;
   }
-
-  intptr_t impl = 0;
-  if (is_our_stub(pid, &t, &impl)) {
-    char l[192];
-    snprintf(l, sizeof(l), "  %s: ya enganchado (stub=0x%lx impl=0x%lx)",
-             sym, (unsigned long)t.target, (unsigned long)impl);
-    logline(l);
-    return 2;
-  }
-  impl = t.target;
+  intptr_t impl = t.target;
 
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  intptr_t cave = find_cave_any(pid, mapbase, sclen, addr, t.kind == 1);
-  if (!cave) {
+  /* Reserva una pagina propia en el proceso (via ptrace) y hazla RWX. */
+  intptr_t page = pt_mmap(pid, 0, STUB_PAGE_SZ, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == -1 || page < 0x1000) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen);
+    snprintf(l, sizeof(l), "  %s: pt_mmap fallo (errno=%d)", sym, pt_errno(pid));
     logline(l);
     return -1;
   }
-
-  if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+  if (kernel_mprotect(pid, page, STUB_PAGE_SZ,
+                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo", sym);
+    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo", sym);
     logline(l);
+    pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  
-  if (kernel_proc_copyin(pid, sc, cave, sclen) != 0) {
+  if (kernel_proc_copyin(pid, sc, page, sclen) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
     logline(l);
-    kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_EXEC);
+    pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  
-  kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-  if (t.kind == 1) {
-    int64_t disp = (int64_t)cave - (int64_t)(addr + t.instr_end);
-    if (disp < INT32_MIN || disp > INT32_MAX) {
-      char l[96];
-      snprintf(l, sizeof(l), "  %s: cave fuera de rango rel32", sym);
-      logline(l);
-      return -1;
-    }
-    int32_t nr = (int32_t)disp;
-    size_t plen = (size_t)t.instr_end;
-    int op = kernel_get_vmem_protection(pid, addr, plen);
-    if (op < 0) op = PROT_READ | PROT_EXEC;
-    if (kernel_mprotect(pid, addr, plen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-      char l[96];
-      snprintf(l, sizeof(l), "  %s: mprotect(thunk) fallo", sym);
-      logline(l);
-      return -1;
-    }
-    if (kernel_proc_copyin(pid, &nr, addr + t.rel_off, 4) != 0) {
-      char l[96];
-      snprintf(l, sizeof(l), "  %s: copyin(rel32) fallo", sym);
-      logline(l);
-      kernel_mprotect(pid, addr, plen, op);
-      return -1;
-    }
-    kernel_mprotect(pid, addr, plen, op);
-  } else {
-    int op = kernel_get_vmem_protection(pid, t.slot, 8);
-    if (op < 0) op = PROT_READ | PROT_WRITE;
-    if (kernel_mprotect(pid, t.slot, 8, PROT_READ | PROT_WRITE) != 0) {
-      char l[96];
-      snprintf(l, sizeof(l), "  %s: mprotect(slot) fallo", sym);
-      logline(l);
-      return -1;
-    }
-    if (kernel_proc_copyin(pid, &cave, t.slot, 8) != 0) {
-      char l[96];
-      snprintf(l, sizeof(l), "  %s: copyin(slot) fallo", sym);
-      logline(l);
-      kernel_mprotect(pid, t.slot, 8, op);
-      return -1;
-    }
-    kernel_mprotect(pid, t.slot, 8, op);
+  /* Parchea el thunk con un salto absoluto a la pagina:
+   *   48 B8 <page:8>   mov rax, page
+   *   FF E0            jmp rax
+   * Son 12 bytes y entran de sobra en los 16 del thunk. */
+  uint8_t patch[12];
+  patch[0] = 0x48;
+  patch[1] = 0xB8;
+  memcpy(patch + 2, &page, 8);
+  patch[10] = 0xFF;
+  patch[11] = 0xE0;
+
+  int op = kernel_get_vmem_protection(pid, addr, sizeof(patch));
+  if (op < 0) op = PROT_READ | PROT_EXEC;
+  if (kernel_mprotect(pid, addr, sizeof(patch),
+                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: mprotect(thunk) fallo", sym);
+    logline(l);
+    pt_munmap(pid, page, STUB_PAGE_SZ);
+    return -1;
   }
+  if (kernel_proc_copyin(pid, patch, addr, sizeof(patch)) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
+    logline(l);
+    kernel_mprotect(pid, addr, sizeof(patch), op);
+    pt_munmap(pid, page, STUB_PAGE_SZ);
+    return -1;
+  }
+  kernel_mprotect(pid, addr, sizeof(patch), op);
 
   char l[192];
   snprintf(l, sizeof(l),
-           "  %s: HOOK OK (%s) prologo=%dB impl=0x%lx cave=0x%lx len=%u",
+           "  %s: HOOK OK (%s) prologo=%dB impl=0x%lx pagina=0x%lx len=%u",
            sym, is_array ? "array" : "single", t.pro_len,
-           (unsigned long)impl, (unsigned long)cave, (unsigned)sclen);
+           (unsigned long)impl, (unsigned long)page, (unsigned)sclen);
   logline(l);
   return 1;
 }
@@ -494,6 +467,14 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
            (int)pid, name, (unsigned)handle, (unsigned long)mapbase);
   logline(m);
 
+  if (pt_attach(pid) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  pid=%d: pt_attach fallo", (int)pid);
+    logline(l);
+    *failed = true;
+    return 0;
+  }
+
   static const struct {
     const char *sym;
     bool is_array;
@@ -504,12 +485,14 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
 
   int fresh = 0;
   for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
-    int r = hook_func(pid, handle, mapbase, targets[i].sym, targets[i].is_array);
+    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array);
     if (r == 1) fresh++;
     else if (r == -1) *failed = true;
   }
   probe_sym(pid, handle, "scePadReadStateExt");
   probe_sym(pid, handle, "scePadReadStateV2");
+
+  pt_detach(pid, 0);
   return fresh;
 }
 
@@ -541,15 +524,15 @@ scan_and_hook(void) {
     if (pid <= 0 || is_system_proc(name)) continue;
     pstate_t *st = pstate_find(pid);
     if (st && st->done) continue;
-    
+
     bool failed = false;
     int r = hook_pad(pid, name, &failed);
-    if (r < 0) continue; 
-    
+    if (r < 0) continue;
+
     if (!st && !(st = pstate_get(pid))) continue;
-    
+
     if (r > 0) new_hooks++;
-    
+
     if (!failed) {
       st->done = true;
     } else if (++st->tries >= MAX_TRIES) {
@@ -567,8 +550,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v5 (AND logic + verbose logs) ===");
-  notify("Activo (v5). Pulsa L1+R1+R3 en el mando roto.");
+  logline("=== LeftStickKiller PASO 2 v6 (pt_mmap + salto absoluto) ===");
+  notify("Activo (v6). Pulsa L1+R1+R3 en el mando roto, dentro del juego o del menu.");
 
   for (;;) {
     int n = scan_and_hook();
