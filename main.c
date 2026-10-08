@@ -1,33 +1,30 @@
-/* LeftStickKiller - PASO 2 (v9): hook de lectura del mando con pagina propia
+/* LeftStickKiller - PASO 2 (v10): hook de lectura del mando con pagina propia
  *
  * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
  * de placa y deriva a la izquierda. Este payload engancha las funciones de
- * lectura del mando en el proceso del juego y del menu, deja pasar la lectura
- * real y luego fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para
- * el mando (handle) que haya pulsado la combinacion L1+R1+R3.
+ * lectura del mando en el proceso del juego, deja pasar la lectura real y luego
+ * fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para el mando
+ * (handle) que haya pulsado la combinacion L1+R1+R3.
  *
- * NOVEDAD v9 (CRITICA - arregla el CUELGUE de la v8):
- *   La v8 parcheaba el thunk con pt_copyin directo, creyendo que kernel_proc_copyin
- *   contaminaria el texto COMPARTIDO de libScePad. En la practica:
- *     - pt_copyin SOBRE EL THUNK (texto compartido/wired) CUELGA el payload
- *       (proc_rwmem se atasca). El log moria justo tras volcar los bytes, sin
- *       HOOK OK ni error, con el juego congelado (attacheado y sin pt_detach).
- *     - kernel_proc_copyin sobre el thunk YA FUNCIONABA en la v6 (HOOK OK) y NO
- *       crasheaba el resto del sistema, luego respeta el mapeo por proceso.
- *   v9: el thunk se vuelve a escribir con kernel_proc_copyin (via llamada
- *   directa) y NUNCA con pt_copyin. El stub (pagina anonima PRIVADA) se sigue
- *   escribiendo con write_mem (kernel y, si falla, pt_copyin), que ahi es seguro.
+ * NOVEDAD v10 (CRITICA - elimina el CUELGUE de v7/v8/v9):
+ *   Las v7/v8/v9 introdujeron pt_copyin (ptrace -> proc_rwmem) para intentar
+ *   cubrir el menu y hacer parches privados. En 11.60 pt_copyin SE CUELGA (tanto
+ *   sobre el texto compartido del thunk como sobre la pagina anonima del stub
+ *   cuando no esta residente). El log moria justo tras volcar los bytes de
+ *   scePadReadState, sin HOOK OK ni error, y dejaba el juego congelado.
  *
- * NOVEDADES v7 (respecto a v6, que ya enganchaba el juego):
- *   1) El menu (SceShellUI) fallaba al escribir el stub ("copyin(stub) fallo"):
- *      la pagina anonima recien mapeada no estaba residente. write_mem cae a
- *      pt_copyin, que fuerza el fallo de pagina en el contexto del proceso.
- *   2) Pre-armado global: en cuanto un stub queda bloqueado (combo pulsado), se
- *      guarda ese handle y se pre-arman los demas. Pulsas L1+R1+R3 una vez.
+ *   La v6 era la unica estable precisamente porque NO usa pt_copyin: escribe
+ *   siempre con kernel_proc_copyin y, si falla, devuelve error limpio (no se
+ *   cuelga). v10 restaura ese mecanismo EXACTO. Es la base solida conocida:
+ *   el juego funciona. (El menu/SceShellUI puede fallar limpio con
+ *   "copyin(stub) fallo" si su pagina no es escribible por esta via, pero NO
+ *   cuelga; cubrir el menu es un problema aparte que requiere pruebas en
+ *   consola, no pt_copyin.)
  *
  * v6 resolvio el problema de fondo: en 11.60 no hay un "code cave" grande cerca
  * del thunk, asi que se reserva una pagina propia con pt_mmap y se parchea el
- * thunk con un salto absoluto (mov rax; jmp rax).
+ * thunk con un salto absoluto (mov rax,imm64; jmp rax, 12 bytes) que cabe en los
+ * 16 bytes del thunk y no depende del rango rel32.
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev. pt.c/pt.h son de John Tornblom.
  */
@@ -49,7 +46,6 @@
 #define LOG_PATH "/data/LeftStickKiller.log"
 #define PAD_STRIDE 0x78 /* sizeof(ScePadData) = 120 */
 #define STUB_PAGE_SZ 0x4000 /* 16 KiB: tamano de pagina de PS5, de sobra */
-#define NO_HANDLE 0xFFFFFFFFu /* valor "sin bloquear" en locked_handle */
 
 #ifndef MAP_ANONYMOUS
 #ifdef MAP_ANON
@@ -93,36 +89,17 @@ logline(const char *line) {
   }
 }
 
-/* ---- Escritura robusta en memoria PRIVADA de otro proceso -------- */
-/* Intenta la via de kernel y, si falla, la de ptrace (fuerza fallo de pagina
- * en el contexto del proceso; necesario para la pagina anonima del stub en el
- * menu). SOLO para memoria privada del proceso. Para el thunk (texto
- * COMPARTIDO) NO se usa esto: pt_copyin sobre texto compartido cuelga, asi que
- * el thunk se escribe con kernel_proc_copyin a secas (ver hook_func). */
-static int
-write_mem(pid_t pid, const void *src, intptr_t dst, size_t len) {
-  if (kernel_proc_copyin(pid, src, dst, len) == 0) return 0;
-  if (pt_copyin(pid, src, dst, len) == 0) return 0;
-  return -1;
-}
-
-/* ---- Estado por proceso (idempotencia + propagacion) ------------- */
+/* ---- Estado por proceso (idempotencia) -------------------------- */
 #define MAX_TRIES 3
 
 typedef struct {
   pid_t pid;
   int tries;
   bool done;
-  intptr_t slot[2]; /* direccion de locked_handle: [0]=single [1]=array */
 } pstate_t;
 
 static pstate_t procs[256];
 static int procs_n = 0;
-
-/* Estado global de "armado": una vez pulsado el combo en cualquier proceso,
- * recordamos el handle para pre-armar el resto. */
-static bool g_armed = false;
-static uint32_t g_handle = NO_HANDLE;
 
 static pstate_t *
 pstate_find(pid_t pid) {
@@ -141,8 +118,9 @@ pstate_get(pid_t pid) {
     return st;
   }
   if (procs_n < (int)(sizeof(procs) / sizeof(procs[0]))) {
-    memset(&procs[procs_n], 0, sizeof(procs[0]));
     procs[procs_n].pid = pid;
+    procs[procs_n].tries = 0;
+    procs[procs_n].done = false;
     return &procs[procs_n++];
   }
   return 0;
@@ -371,11 +349,9 @@ probe_sym(pid_t pid, uint32_t handle, const char *sym) {
 }
 
 /* ---- Hook de una funcion (proceso YA attacheado con ptrace) ------ */
-/* En exito (return 1) deja en *slot_out la direccion de locked_handle. */
+/* v10: TODAS las escrituras usan kernel_proc_copyin. NUNCA pt_copyin (cuelga). */
 static int
-hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
-          intptr_t *slot_out) {
-  if (slot_out) *slot_out = 0;
+hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   intptr_t addr = kernel_dynlib_dlsym(pid, handle, sym);
   if (!addr) {
     char l[96];
@@ -415,7 +391,7 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  /* Reserva una pagina propia (anonima, PRIVADA) en el proceso y hazla RWX. */
+  /* Reserva una pagina propia en el proceso (via ptrace) y hazla RWX. */
   intptr_t page = pt_mmap(pid, 0, STUB_PAGE_SZ, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (page == -1 || page < 0x1000) {
@@ -427,18 +403,14 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
   if (kernel_mprotect(pid, page, STUB_PAGE_SZ,
                       PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo (pagina=0x%lx)",
-             sym, (unsigned long)page);
+    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo", sym);
     logline(l);
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  /* El stub va en memoria anonima PRIVADA: write_mem (kernel y, si falla, el
-   * fallback pt_copyin que fuerza el fallo de pagina) es seguro aqui. */
-  if (write_mem(pid, sc, page, sclen) != 0) {
+  if (kernel_proc_copyin(pid, sc, page, sclen) != 0) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: copyin(stub) fallo (pagina=0x%lx)",
-             sym, (unsigned long)page);
+    snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
     logline(l);
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
@@ -465,10 +437,6 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
     pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
-  /* IMPORTANTE (v9): el thunk esta en el TEXTO de libScePad. Se escribe con
-   * kernel_proc_copyin A SECAS. NO usar pt_copyin aqui: pt_copyin/proc_rwmem
-   * sobre esa pagina compartida/wired CUELGA el payload (fue el bug de la v8).
-   * kernel_proc_copyin ya funcionaba en la v6 y respeta el mapeo por proceso. */
   if (kernel_proc_copyin(pid, patch, addr, sizeof(patch)) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
@@ -478,8 +446,6 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
     return -1;
   }
   kernel_mprotect(pid, addr, sizeof(patch), op);
-
-  if (slot_out) *slot_out = page + (intptr_t)sclen - 4;
 
   char l[192];
   snprintf(l, sizeof(l),
@@ -492,11 +458,9 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array,
 
 /* ---- Hook en un proceso ------------------------------------------ */
 static int
-hook_pad(pid_t pid, const char *name, bool *failed, intptr_t slots_out[2]) {
+hook_pad(pid_t pid, const char *name, bool *failed) {
   uint32_t handle = 0;
   *failed = false;
-  slots_out[0] = 0;
-  slots_out[1] = 0;
   if (kernel_dynlib_handle(pid, "libScePad.sprx", &handle) != 0 || !handle) {
     return -1;
   }
@@ -525,8 +489,7 @@ hook_pad(pid_t pid, const char *name, bool *failed, intptr_t slots_out[2]) {
 
   int fresh = 0;
   for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
-    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array,
-                      &slots_out[i]);
+    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array);
     if (r == 1) fresh++;
     else if (r == -1) *failed = true;
   }
@@ -535,47 +498,6 @@ hook_pad(pid_t pid, const char *name, bool *failed, intptr_t slots_out[2]) {
 
   pt_detach(pid, 0);
   return fresh;
-}
-
-/* ---- Propagacion del "armado" entre procesos --------------------- */
-/* Lee los locked_handle de todos los stubs. Si alguno esta bloqueado (combo
- * pulsado), guarda ese handle como global y lo escribe en el resto de stubs
- * que aun no esten bloqueados, para no tener que repetir el combo en cada
- * juego/proceso. Escribe en la pagina anonima PRIVADA del stub (no en texto
- * compartido), asi que kernel_proc_copyin aqui es seguro y best-effort. */
-static void
-propagate_arm(void) {
-  /* 1) Detectar un combo ya pulsado en cualquier stub. */
-  for (int i = 0; i < procs_n && !g_armed; i++) {
-    for (int k = 0; k < 2; k++) {
-      intptr_t s = procs[i].slot[k];
-      if (!s) continue;
-      uint32_t v = NO_HANDLE;
-      if (kernel_proc_copyout(procs[i].pid, s, &v, 4) == 0 && v != NO_HANDLE) {
-        g_handle = v;
-        g_armed = true;
-        char l[112];
-        snprintf(l, sizeof(l),
-                 "  ARMADO global: handle=%u (pre-armo el resto de procesos)",
-                 (unsigned)v);
-        logline(l);
-        break;
-      }
-    }
-  }
-
-  /* 2) Si estamos armados, pre-armar los stubs que sigan sin bloquear. */
-  if (!g_armed) return;
-  for (int i = 0; i < procs_n; i++) {
-    for (int k = 0; k < 2; k++) {
-      intptr_t s = procs[i].slot[k];
-      if (!s) continue;
-      uint32_t v = NO_HANDLE;
-      if (kernel_proc_copyout(procs[i].pid, s, &v, 4) == 0 && v == NO_HANDLE) {
-        kernel_proc_copyin(procs[i].pid, &g_handle, s, 4); /* best-effort */
-      }
-    }
-  }
 }
 
 /* ---- Barrido de procesos ----------------------------------------- */
@@ -608,14 +530,10 @@ scan_and_hook(void) {
     if (st && st->done) continue;
 
     bool failed = false;
-    intptr_t slots_out[2] = {0, 0};
-    int r = hook_pad(pid, name, &failed, slots_out);
+    int r = hook_pad(pid, name, &failed);
     if (r < 0) continue;
 
     if (!st && !(st = pstate_get(pid))) continue;
-
-    if (slots_out[0]) st->slot[0] = slots_out[0];
-    if (slots_out[1]) st->slot[1] = slots_out[1];
 
     if (r > 0) new_hooks++;
 
@@ -636,12 +554,11 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v9 (arregla el cuelgue de la v8) ===");
-  notify("Activo (v9). Pulsa L1+R1+R3 UNA vez en el mando roto; vale para juego y menu.");
+  logline("=== LeftStickKiller PASO 2 v10 (= mecanismo v6 estable, sin pt_copyin) ===");
+  notify("Activo (v10). Pulsa L1+R1+R3 en el mando roto dentro del juego.");
 
   for (;;) {
     int n = scan_and_hook();
-    propagate_arm();
     if (n > 0) {
       char msg[128];
       snprintf(msg, sizeof(msg),
