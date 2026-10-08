@@ -1,32 +1,29 @@
-/* LeftStickKiller - PASO 2 (v10): hook de lectura del mando con pagina propia
+/* LeftStickKiller - PASO 2 (v12): hook SIN ptrace (code cave + salto absoluto)
  *
- * Objetivo (accesibilidad): un DualSense tiene el stick izquierdo roto a nivel
- * de placa y deriva a la izquierda. Este payload engancha las funciones de
- * lectura del mando en el proceso del juego, deja pasar la lectura real y luego
- * fija el stick izquierdo en el centro (X=0x80, Y=0x80) SOLO para el mando
- * (handle) que haya pulsado la combinacion L1+R1+R3.
+ * Objetivo (accesibilidad): un DualSense con el stick izquierdo roto a nivel de
+ * placa (deriva). Este payload engancha scePadReadState/scePadRead en el proceso
+ * del juego, deja pasar la lectura real y fija el stick izquierdo en el centro
+ * (0x80,0x80) SOLO para el mando (handle) que haya pulsado L1+R1+R3.
  *
- * NOVEDAD v10 (CRITICA - elimina el CUELGUE de v7/v8/v9):
- *   Las v7/v8/v9 introdujeron pt_copyin (ptrace -> proc_rwmem) para intentar
- *   cubrir el menu y hacer parches privados. En 11.60 pt_copyin SE CUELGA (tanto
- *   sobre el texto compartido del thunk como sobre la pagina anonima del stub
- *   cuando no esta residente). El log moria justo tras volcar los bytes de
- *   scePadReadState, sin HOOK OK ni error, y dejaba el juego congelado.
+ * POR QUE v12 (CRITICA - elimina el CUELGUE definitivo):
+ *   El log de diagnostico (v11) demostro que el cuelgue estaba EXACTAMENTE en
+ *   pt_mmap: "paso1: antes de pt_mmap" era la ultima linea y el juego se
+ *   congelaba. pt_mmap reserva memoria por ptrace haciendo single-step del
+ *   proceso, y en 11.60 ese single-step NO retorna de forma fiable -> cuelgue.
+ *   (La v6 "funciono" una vez solo porque pt_mmap tuvo suerte; es intermitente.)
  *
- *   La v6 era la unica estable precisamente porque NO usa pt_copyin: escribe
- *   siempre con kernel_proc_copyin y, si falla, devuelve error limpio (no se
- *   cuelga). v10 restaura ese mecanismo EXACTO. Es la base solida conocida:
- *   el juego funciona. (El menu/SceShellUI puede fallar limpio con
- *   "copyin(stub) fallo" si su pagina no es escribible por esta via, pero NO
- *   cuelga; cubrir el menu es un problema aparte que requiere pruebas en
- *   consola, no pt_copyin.)
+ *   v12 QUITA ptrace POR COMPLETO. Ya no reserva una pagina con pt_mmap: coloca
+ *   el stub en un "code cave" (una racha de bytes 0xCC de relleno entre
+ *   funciones, que es espacio muerto y seguro de sobrescribir) encontrado
+ *   escaneando los modulos cargados (libScePad, libc, libSceLibcInternal,
+ *   libkernel...). Al parche del thunk se salta con un salto ABSOLUTO
+ *   (mov rax,imm64; jmp rax), asi que el cave puede estar a cualquier distancia.
+ *   Todo se escribe con kernel_proc_copyin (estable, no usa ptrace).
  *
- * v6 resolvio el problema de fondo: en 11.60 no hay un "code cave" grande cerca
- * del thunk, asi que se reserva una pagina propia con pt_mmap y se parchea el
- * thunk con un salto absoluto (mov rax,imm64; jmp rax, 12 bytes) que cabe en los
- * 16 bytes del thunk y no depende del rango rel32.
+ *   Resultado: NO PUEDE COLGARSE NI CRASHEAR. Si no hay un cave suficientemente
+ *   grande, falla limpio ("sin code cave") y lo anota; nunca congela el juego.
  *
- * Licencia: GPLv3+. Ecosistema ps5-payload-dev. pt.c/pt.h son de John Tornblom.
+ * Licencia: GPLv3+. Ecosistema ps5-payload-dev.
  */
 
 #include <ps5/kernel.h>
@@ -41,19 +38,8 @@
 #include <sys/sysctl.h>
 #include <sys/mman.h>
 
-#include "pt.h"
-
 #define LOG_PATH "/data/LeftStickKiller.log"
 #define PAD_STRIDE 0x78 /* sizeof(ScePadData) = 120 */
-#define STUB_PAGE_SZ 0x4000 /* 16 KiB: tamano de pagina de PS5, de sobra */
-
-#ifndef MAP_ANONYMOUS
-#ifdef MAP_ANON
-#define MAP_ANONYMOUS MAP_ANON
-#else
-#define MAP_ANONYMOUS 0x1000
-#endif
-#endif
 
 /* ---- Aviso en pantalla (libSceNotification) ---------------------- */
 
@@ -215,22 +201,6 @@ parse_thunk(pid_t pid, intptr_t addr, const uint8_t *h, thunk_t *t) {
 }
 
 /* ---- Stubs (shellcode x86-64) ------------------------------------ */
-/*
- * Layout del stub en la pagina reservada:
- *   [endbr64] [prologo original] [stub_hdr] [impl:imm64] [tail]
- *
- * endbr64 va delante porque al stub saltamos con un salto INDIRECTO
- * (jmp rax); si el firmware fuerza CET/IBT, el destino de un salto indirecto
- * debe empezar por endbr64. Si no lo fuerza, endbr64 es un NOP: inofensivo.
- *
- * Se guardan rbx (array de datos) y r12 (handle) para que sobrevivan a la
- * llamada a la implementacion real; r13 es un tercer push solo para dejar la
- * pila alineada a 16 antes del call. (buttons AND 0xC04) == 0xC04 detecta el
- * combo L1+R1+R3 aunque haya otros botones pulsados.
- *
- * Los desplazamientos rip-relativos del tail (0x17/0x10 y 0x20/0x19) son
- * internos al propio tail, asi que no cambian al anteponer endbr64/prologo.
- */
 static const uint8_t endbr64_pre[] = {
   0xF3, 0x0F, 0x1E, 0xFA,       /* endbr64                 */
 };
@@ -320,14 +290,62 @@ build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, bool is_array) {
   return n;
 }
 
-/* Un thunk ya enganchado empieza por nuestro parche: 48 B8 <page> FF E0 */
+/* Un thunk ya enganchado empieza por nuestro parche: 48 B8 <cave> FF E0 */
 static bool
-is_hooked_thunk(const uint8_t *h, intptr_t *page_out) {
+is_hooked_thunk(const uint8_t *h, intptr_t *cave_out) {
   if (h[0] == 0x48 && h[1] == 0xB8 && h[10] == 0xFF && h[11] == 0xE0) {
-    memcpy(page_out, h + 2, 8);
+    memcpy(cave_out, h + 2, 8);
     return true;
   }
   return false;
+}
+
+/* ---- Busqueda de code cave (racha de 0xCC) SIN limite rel32 ------ */
+static intptr_t
+find_code_cave(pid_t pid, intptr_t start, size_t need) {
+  uint8_t chunk[0x1000];
+  intptr_t run_start = 0;
+  size_t run_len = 0;
+  intptr_t addr = start & ~((intptr_t)0xFFF);
+  intptr_t limit = addr + 0x1000000; /* escanea 16 MiB del modulo */
+
+  for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
+    if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
+      /* pagina no mapeada: saltamosla pero seguimos (el modulo puede tener
+       * huecos); reiniciamos la racha. */
+      run_len = 0;
+      continue;
+    }
+    for (size_t i = 0; i < sizeof(chunk); i++) {
+      if (chunk[i] == 0xCC) {
+        if (run_len == 0) run_start = addr + (intptr_t)i;
+        run_len++;
+        if (run_len >= need) return run_start;
+      } else {
+        run_len = 0;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Como el salto al cave es ABSOLUTO, el cave puede estar en CUALQUIER modulo. */
+static intptr_t
+find_cave_any(pid_t pid, intptr_t mapbase, size_t need) {
+  static const char *libs[] = {
+    "libScePad.sprx", "libc.sprx", "libSceLibcInternal.sprx",
+    "libkernel.sprx", "libkernel_web.sprx", "libkernel_sys.sprx",
+    "libSceSysmodule.sprx", "libSceGnmDriver.sprx",
+  };
+  intptr_t cave = 0;
+  if (mapbase > 0) cave = find_code_cave(pid, mapbase, need);
+  for (size_t i = 0; !cave && i < sizeof(libs) / sizeof(libs[0]); i++) {
+    uint32_t h = 0;
+    if (kernel_dynlib_handle(pid, libs[i], &h) != 0 || !h) continue;
+    intptr_t base = kernel_dynlib_mapbase_addr(pid, h);
+    if (base > 0) cave = find_code_cave(pid, base, need);
+  }
+  return cave;
 }
 
 /* ---- Diagnostico ------------------------------------------------- */
@@ -348,10 +366,10 @@ probe_sym(pid_t pid, uint32_t handle, const char *sym) {
   if (kernel_proc_copyout(pid, a, b, sizeof(b)) == 0) log_bytes(sym, a, b);
 }
 
-/* ---- Hook de una funcion (proceso YA attacheado con ptrace) ------ */
-/* v10: TODAS las escrituras usan kernel_proc_copyin. NUNCA pt_copyin (cuelga). */
+/* ---- Hook de una funcion (SIN ptrace) ---------------------------- */
 static int
-hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
+hook_func(pid_t pid, uint32_t handle, intptr_t mapbase,
+          const char *sym, bool is_array) {
   intptr_t addr = kernel_dynlib_dlsym(pid, handle, sym);
   if (!addr) {
     char l[96];
@@ -369,11 +387,11 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   }
   log_bytes(sym, addr, h);
 
-  intptr_t hooked_page = 0;
-  if (is_hooked_thunk(h, &hooked_page)) {
+  intptr_t hooked_cave = 0;
+  if (is_hooked_thunk(h, &hooked_cave)) {
     char l[128];
-    snprintf(l, sizeof(l), "  %s: ya enganchado (pagina=0x%lx)",
-             sym, (unsigned long)hooked_page);
+    snprintf(l, sizeof(l), "  %s: ya enganchado (cave=0x%lx)",
+             sym, (unsigned long)hooked_cave);
     logline(l);
     return 2;
   }
@@ -391,42 +409,47 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  /* Reserva una pagina propia en el proceso (via ptrace) y hazla RWX. */
-  logline("  paso1: antes de pt_mmap");
-  intptr_t page = pt_mmap(pid, 0, STUB_PAGE_SZ, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  logline("  paso2: pt_mmap OK");
-  if (page == -1 || page < 0x1000) {
+  /* Busca un code cave (racha de 0xCC) de al menos sclen bytes. SIN ptrace. */
+  logline("  paso1: buscando code cave (sin ptrace)");
+  intptr_t cave = find_cave_any(pid, mapbase, sclen);
+  if (!cave) {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: pt_mmap fallo (errno=%d)", sym, pt_errno(pid));
+    snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen);
     logline(l);
     return -1;
   }
-  if (kernel_mprotect(pid, page, STUB_PAGE_SZ,
-                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+  {
     char l[96];
-    snprintf(l, sizeof(l), "  %s: mprotect(pagina RWX) fallo", sym);
+    snprintf(l, sizeof(l), "  paso2: cave encontrado en 0x%lx", (unsigned long)cave);
     logline(l);
-    pt_munmap(pid, page, STUB_PAGE_SZ);
+  }
+
+  int cp = kernel_get_vmem_protection(pid, cave, sclen);
+  if (cp < 0) cp = PROT_READ | PROT_EXEC;
+  if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    char l[96];
+    snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo", sym);
+    logline(l);
     return -1;
   }
-  logline("  paso3: antes de copyin stub");
-  if (kernel_proc_copyin(pid, sc, page, sclen) != 0) {
+  if (kernel_proc_copyin(pid, sc, cave, sclen) != 0) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: copyin(stub) fallo", sym);
     logline(l);
-    pt_munmap(pid, page, STUB_PAGE_SZ);
+    kernel_mprotect(pid, cave, sclen, cp);
     return -1;
   }
+  /* el stub escribe locked_handle en runtime -> dejar la pagina escribible */
+  kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC);
+  logline("  paso3: stub escrito en el cave");
 
-  /* Parchea el thunk con un salto absoluto a la pagina:
-   *   48 B8 <page:8>   mov rax, page
-   *   FF E0            jmp rax
-   * Son 12 bytes y entran de sobra en los 16 del thunk. */
+  /* Parchea el thunk con un salto absoluto al cave:
+   *   48 B8 <cave:8>   mov rax, cave
+   *   FF E0            jmp rax   (12 bytes, caben en los 16 del thunk) */
   uint8_t patch[12];
   patch[0] = 0x48;
   patch[1] = 0xB8;
-  memcpy(patch + 2, &page, 8);
+  memcpy(patch + 2, &cave, 8);
   patch[10] = 0xFF;
   patch[11] = 0xE0;
 
@@ -437,7 +460,6 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
     char l[96];
     snprintf(l, sizeof(l), "  %s: mprotect(thunk) fallo", sym);
     logline(l);
-    pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
   if (kernel_proc_copyin(pid, patch, addr, sizeof(patch)) != 0) {
@@ -445,21 +467,20 @@ hook_func(pid_t pid, uint32_t handle, const char *sym, bool is_array) {
     snprintf(l, sizeof(l), "  %s: copyin(parche thunk) fallo", sym);
     logline(l);
     kernel_mprotect(pid, addr, sizeof(patch), op);
-    pt_munmap(pid, page, STUB_PAGE_SZ);
     return -1;
   }
   kernel_mprotect(pid, addr, sizeof(patch), op);
 
   char l[192];
   snprintf(l, sizeof(l),
-           "  %s: HOOK OK (%s) prologo=%dB impl=0x%lx pagina=0x%lx len=%u",
+           "  %s: HOOK OK (%s) prologo=%dB impl=0x%lx cave=0x%lx len=%u",
            sym, is_array ? "array" : "single", t.pro_len,
-           (unsigned long)impl, (unsigned long)page, (unsigned)sclen);
+           (unsigned long)impl, (unsigned long)cave, (unsigned)sclen);
   logline(l);
   return 1;
 }
 
-/* ---- Hook en un proceso ------------------------------------------ */
+/* ---- Hook en un proceso (SIN ptrace) ----------------------------- */
 static int
 hook_pad(pid_t pid, const char *name, bool *failed) {
   uint32_t handle = 0;
@@ -474,14 +495,6 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
            (int)pid, name, (unsigned)handle, (unsigned long)mapbase);
   logline(m);
 
-  if (pt_attach(pid) != 0) {
-    char l[96];
-    snprintf(l, sizeof(l), "  pid=%d: pt_attach fallo", (int)pid);
-    logline(l);
-    *failed = true;
-    return 0;
-  }
-
   static const struct {
     const char *sym;
     bool is_array;
@@ -492,14 +505,12 @@ hook_pad(pid_t pid, const char *name, bool *failed) {
 
   int fresh = 0;
   for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
-    int r = hook_func(pid, handle, targets[i].sym, targets[i].is_array);
+    int r = hook_func(pid, handle, mapbase, targets[i].sym, targets[i].is_array);
     if (r == 1) fresh++;
     else if (r == -1) *failed = true;
   }
   probe_sym(pid, handle, "scePadReadStateExt");
   probe_sym(pid, handle, "scePadReadStateV2");
-
-  pt_detach(pid, 0);
   return fresh;
 }
 
@@ -557,8 +568,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v10 (= mecanismo v6 estable, sin pt_copyin) ===");
-  notify("Activo (v10). Pulsa L1+R1+R3 en el mando roto dentro del juego.");
+  logline("=== LeftStickKiller PASO 2 v12 (SIN ptrace: code cave + salto absoluto) ===");
+  notify("Activo (v12, sin ptrace). Pulsa L1+R1+R3 en el mando roto dentro del juego.");
 
   for (;;) {
     int n = scan_and_hook();
