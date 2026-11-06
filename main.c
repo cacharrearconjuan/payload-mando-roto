@@ -1,13 +1,4 @@
-/* LeftStickKiller - v1.0.x: hook relativo, soporte menú y juego
- *
- * CAMBIOS IMPORTANTES:
- *   1. Salto relativo (E9) en lugar de absoluto. Ahora funciona en SceShellUI
- *      y SceShellCore porque el offset es el mismo en todos los procesos.
- *   2. Code cave buscado SOLO en libScePad para garantizar que el offset
- *      relativo sea constante.
- *   3. Bucle de scePadRead limitado a 4 (en lugar de 64) para no corromper
- *      la memoria del juego (esto arregla el fallo del stick derecho).
- */
+/* LeftStickKiller - v1.0.x: hook relativo estable, soporte menú y juego */
 
 #include <ps5/kernel.h>
 
@@ -158,9 +149,11 @@ static const uint8_t stub_hdr[] = {
   0x53, 0x41, 0x54, 0x41, 0x55,
   0x48, 0x89, 0xF3,             /* mov  rbx, rsi           */
   0x49, 0x89, 0xFC,             /* mov  r12, rdi           */
+  0x48, 0xB8,                   /* mov  rax, imm64 (impl)  */
 };
 
 static const uint8_t stub_single_tail[] = {
+  0xFF, 0xD0,                               /* call rax                */
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
@@ -174,32 +167,34 @@ static const uint8_t stub_single_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
+/* Bucle del array: usa EDX como contador para NO sobrescribir EAX (valor de retorno) */
 static const uint8_t stub_array_tail[] = {
-  0x50,                                     /* push rax                */
-  0x83, 0xF8, 0x04,                         /* cmp eax, 4 (antes 64)   */
-  0x7E, 0x05,                               /* jle +5                  */
-  0xB8, 0x04, 0x00, 0x00, 0x00,             /* mov eax, 4              */
-  0x85, 0xC0,                               /* test eax, eax           */
-  0x7E, 0x30,                               /* jle +0x30 (done_loop)   */
+  0xFF, 0xD0,                               /* call rax                */
+  0x89, 0xC2,                               /* mov edx, eax            */
+  0x85, 0xD2,                               /* test edx, edx           */
+  0x7E, 0x30,                               /* jle done_loop (+0x30)   */
+  /* loop_start (offset 8) */
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
   0x75, 0x07,                               /* jne skip_lock (+7)      */
-  0x44, 0x89, 0x25, 0x20, 0x00, 0x00, 0x00, /* mov dword [rip+0x20], r12d */
-  0x44, 0x3B, 0x25, 0x19, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x19] */
+  0x44, 0x89, 0x25, 0x1F, 0x00, 0x00, 0x00, /* mov dword [rip+0x1F], r12d */
+  0x44, 0x3B, 0x25, 0x18, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x18] */
   0x75, 0x08,                               /* jne next_iter (+8)      */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
+  /* next_iter (offset 48) */
   0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           */
-  0xFF, 0xC8,                               /* dec eax                 */
-  0x75, 0xD0,                               /* jnz -0x30 (loop_start)  */
-  0x58, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3, /* pop rax, pop r13, pop r12, pop rbx, ret */
-  0xFF, 0xFF, 0xFF, 0xFF
+  0xFF, 0xCA,                               /* dec edx                 */
+  0x75, 0xD0,                               /* jnz loop_start (-0x30)  */
+  /* done_loop (offset 56) */
+  0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,       /* pop r13, pop r12, pop rbx, ret */
+  0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-#define STUB_MAX (sizeof(endbr64_pre) + MAX_PRO + sizeof(stub_hdr) + 5 + sizeof(stub_array_tail))
+#define STUB_MAX (sizeof(endbr64_pre) + MAX_PRO + sizeof(stub_hdr) + 8 + sizeof(stub_array_tail))
 
-static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t cave, bool is_array) {
+static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, bool is_array) {
   size_t n = 0;
   memcpy(sc + n, endbr64_pre, sizeof(endbr64_pre));
   n += sizeof(endbr64_pre);
@@ -207,12 +202,8 @@ static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t 
   n += t->pro_len;
   memcpy(sc + n, stub_hdr, sizeof(stub_hdr));
   n += sizeof(stub_hdr);
-
-  /* call impl (E8 rel32) en lugar de mov rax, impl */
-  int32_t rel = (int32_t)(impl - (cave + n + 5));
-  sc[n] = 0xE8;
-  memcpy(sc + n + 1, &rel, 4);
-  n += 5;
+  memcpy(sc + n, &impl, 8);
+  n += 8;
 
   if (is_array) {
     memcpy(sc + n, stub_array_tail, sizeof(stub_array_tail));
@@ -228,12 +219,14 @@ static bool is_hooked_thunk(const uint8_t *h) {
   return h[0] == 0xE9;
 }
 
+/* Busca el code cave desde un poco antes de la base hasta adelante */
 static intptr_t find_code_cave(pid_t pid, intptr_t start, size_t need) {
   uint8_t chunk[0x1000];
   intptr_t run_start = 0;
   size_t run_len = 0;
-  intptr_t addr = start & ~((intptr_t)0xFFF);
-  intptr_t limit = addr + 0x1000000;
+  intptr_t addr = (start - 0x200000) & ~((intptr_t)0xFFF);
+  intptr_t limit = start + 0x1000000;
+  
   for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
     if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
       run_len = 0; continue;
@@ -293,9 +286,9 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
   intptr_t impl = t.target;
 
   uint8_t sc[STUB_MAX];
-  size_t sclen = build_stub(sc, &t, impl, 0, is_array); /* cave se rellena luego */
+  size_t sclen = build_stub(sc, &t, impl, is_array);
 
-  logline("  paso1: buscando code cave en libScePad");
+  logline("  paso1: buscando code cave");
   intptr_t cave = find_code_cave(pid, mapbase, sclen);
   if (!cave) {
     char l[96]; snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen); logline(l);
@@ -304,8 +297,6 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
   {
     char l[96]; snprintf(l, sizeof(l), "  paso2: cave encontrado en 0x%lx", (unsigned long)cave); logline(l);
   }
-
-  sclen = build_stub(sc, &t, impl, cave, is_array); /* re-generar con el cave real */
 
   int cp = kernel_get_vmem_protection(pid, cave, sclen);
   if (cp < 0) cp = PROT_READ | PROT_EXEC;
@@ -341,8 +332,8 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
 
   char l[192];
   snprintf(l, sizeof(l),
-           "  %s: HOOK OK (relativo) impl=0x%lx cave=0x%lx rel=%d len=%u",
-           sym, (unsigned long)impl, (unsigned long)cave, rel_cave, (unsigned)sclen);
+           "  %s: HOOK OK (relativo) impl=0x%lx cave=0x%lx len=%u",
+           sym, (unsigned long)impl, (unsigned long)cave, (unsigned)sclen);
   logline(l);
   return 1;
 }
@@ -421,7 +412,7 @@ static int scan_and_hook(void) {
 }
 
 int main(void) {
-  logline("=== LeftStickKiller " LSK_VERSION " (menu + juego, rel) ===");
+  logline("=== LeftStickKiller " LSK_VERSION " (menu + juego) ===");
   notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3 en el menu o en el juego.");
 
   for (;;) {
