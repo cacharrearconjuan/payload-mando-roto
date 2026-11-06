@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necesario para contar todos los commits
 
       - name: Instalar dependencias
         run: |
@@ -25,22 +27,33 @@ jobs:
           wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
           sudo unzip -q -d /opt ps5-payload-sdk.zip
 
+      - name: Calcular version (1.0.<nº de commits>)
+        id: ver
+        run: |
+          # Cuenta el número de commits reales. Sube solo cuando tú subes código.
+          COMMITS=$(git rev-list --count HEAD)
+          echo "v=1.0.$COMMITS" >> "$GITHUB_OUTPUT"
+
+      - name: Generar version.h
+        run: |
+          # Esto inyecta la versión correcta dentro del .elf
+          echo '#define LSK_VERSION "v${{ steps.ver.outputs.v }}"' > version.h
+
       - name: Compilar el payload
         run: |
           export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
           make
 
-      - name: Calcular version (1.0.<run_number-1>)
-        id: ver
+      - name: Renombrar el .elf con la version
         run: |
-          n=$(( ${{ github.run_number }} - 1 ))
-          echo "v=1.0.$n" >> "$GITHUB_OUTPUT"
+          # El fichero se llamará LeftStickKiller-v1.0.X.elf
+          mv LeftStickKiller.elf LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Subir el .elf como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: LeftStickKiller-v${{ steps.ver.outputs.v }}
-          path: LeftStickKiller.elf
+          path: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Publicar el .elf como Release descargable
         if: github.event_name != 'pull_request'
@@ -54,9 +67,9 @@ jobs:
             Commit: ${{ github.sha }}
             Versión: v${{ steps.ver.outputs.v }}
 
-            Descarga `LeftStickKiller.elf` de Assets y cárgalo en la PS5
+            Descarga el `.elf` de Assets y cárgalo en la PS5
             desde Payload Manager (recomendado) o con:
-            `nc -q0 <IP_PS5> 9021 < LeftStickKiller.elf`
-          files: LeftStickKiller.elf
+            `nc -q0 <IP_PS5> 9021 < LeftStickKiller-v${{ steps.ver.outputs.v }}.elf`
+          files: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
           draft: false
           prerelease: true
