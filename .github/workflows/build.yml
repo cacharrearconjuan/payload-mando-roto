@@ -32,7 +32,9 @@ jobs:
 
       - name: Calcular version (1.0.<run_number-1>)
         id: ver
-        run: echo "v=1.0.${{ github.run_number - 1 }}" >> "$GITHUB_OUTPUT"
+        run: |
+          n=$(( ${{ github.run_number }} - 1 ))
+          echo "v=1.0.$n" >> "$GITHUB_OUTPUT"
 
       - name: Subir el .elf como artefacto
         uses: actions/upload-artifact@v4
