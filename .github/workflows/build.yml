@@ -10,14 +10,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 LTS: estable, sin los problemas de red de ubuntu-26.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Instalar dependencias
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-18 lld-18 wget unzip
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 wget unzip
 
       - name: Instalar el ps5-payload-sdk
         run: |
@@ -29,20 +30,32 @@ jobs:
           export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
           make
 
+      - name: Calcular version (1.0.<run_number-1>)
+        id: ver
+        run: echo "v=1.0.${{ github.run_number - 1 }}" >> "$GITHUB_OUTPUT"
+
       - name: Subir el .elf como artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: LeftStickKiller
+          name: LeftStickKiller-v${{ steps.ver.outputs.v }}
           path: LeftStickKiller.elf
 
       - name: Publicar el .elf como Release descargable
-        if: github.event_name == 'push'
+        # Se ejecuta en push y en ejecución manual, pero NO en Pull Requests
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Ultima compilacion (LeftStickKiller.elf)
+          tag_name: v${{ steps.ver.outputs.v }}
+          name: LeftStickKiller v${{ steps.ver.outputs.v }}
           body: |
-            Compilacion automatica de LeftStickKiller.elf desde la rama de trabajo.
-            Descarga el .elf de aqui abajo (en Assets) y cargalo en la PS5:
-            nc -q0 <IP_PS5> 9021 < LeftStickKiller.elf
+            Compilación automática de LeftStickKiller.elf
+            Rama: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Versión: v${{ steps.ver.outputs.v }}
+
+            Descarga `LeftStickKiller.elf` de Assets y cárgalo en la PS5
+            desde Payload Manager (recomendado) o con:
+            `nc -q0 <IP_PS5> 9021 < LeftStickKiller.elf`
           files: LeftStickKiller.elf
+          draft: false
+          prerelease: true
