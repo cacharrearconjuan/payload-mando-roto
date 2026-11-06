@@ -303,11 +303,11 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
 
   int cp = kernel_get_vmem_protection(pid, cave, sclen);
   if (cp < 0 || !(cp & PROT_EXEC)) {
-    char l[96]; snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo", sym); logline(l);
+    char l[128]; snprintf(l, sizeof(l), "  %s: cave en 0x%lx no es ejecutable, descartado", sym, (unsigned long)cave); logline(l);
     return -1;
   }
   if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-    char l[96]; snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo", sym); logline(l);
+    char l[128]; snprintf(l, sizeof(l), "  %s: mprotect(cave RWX) fallo real", sym); logline(l);
     return -1;
   }
   if (kernel_proc_copyin(pid, sc, cave, sclen) != 0) {
