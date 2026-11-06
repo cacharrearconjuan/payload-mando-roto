@@ -1,9 +1,18 @@
-/* LeftStickKiller - PASO 2 (v12): hook SIN ptrace (code cave + salto absoluto)
+/* LeftStickKiller - PASO 2 (v13): hook SIN ptrace + soporte menú de consola
  *
  * Objetivo (accesibilidad): un DualSense con el stick izquierdo roto a nivel de
  * placa (deriva). Este payload engancha scePadReadState/scePadRead en el proceso
- * del juego, deja pasar la lectura real y fija el stick izquierdo en el centro
- * (0x80,0x80) SOLO para el mando (handle) que haya pulsado L1+R1+R3.
+ * del juego Y en el menú de la consola, deja pasar la lectura real y fija el
+ * stick izquierdo en el centro (0x80,0x80) SOLO para el mando (handle) que haya
+ * pulsado L1+R1+R3.
+ *
+ * CAMBIO v13 (menu de la consola):
+ *   En v12 SceShellCore estaba en la lista negra de is_system_proc, por lo que
+ *   el payload NUNCA lo enganchaba. En PS5 el menu lee el pad a traves de
+ *   SceShellCore, asi que L1+R1+R3 no hacia nada fuera del juego. En v13 se
+ *   elimina SceShellCore de la lista negra; ahora se escanea, y si tiene
+ *   libScePad.sprx cargado, se le aplica el mismo hook que al juego.
+ *   SceShellUI ya no estaba en la lista; se mantiene asi.
  *
  * POR QUE v12 (CRITICA - elimina el CUELGUE definitivo):
  *   El log de diagnostico (v11) demostro que el cuelgue estaba EXACTAMENTE en
@@ -112,11 +121,20 @@ pstate_get(pid_t pid) {
   return 0;
 }
 
-/* SceShellUI NO esta en la lista, para poder enganchar el menu del sistema. */
+/* Lista negra de procesos que NO queremos enganchar.
+ *
+ * v13: SceShellCore se ha ELIMINADO de la lista. En PS5 el menu de la consola
+ * lee el pad a traves de SceShellCore; si lo vetamos, L1+R1+R3 no funciona
+ * fuera del juego. SceShellUI nunca estuvo en la lista, asi que ya se
+ * escaneaba; ahora tambien se escanea SceShellCore.
+ *
+ * Nota: si tras este cambio el log muestra "sin code cave" para SceShellCore,
+ * no es un problema de esta lista: es que ese proceso no tiene una racha de
+ * 0xCC lo bastante grande en los modulos escaneados. En ese caso el payload
+ * falla LIMPIO y NO congela el menu. */
 static bool
 is_system_proc(const char *name) {
-  return !strcmp(name, "SceShellCore") ||
-         !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
+  return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
          !strcmp(name, "SceSysCore")    || !strcmp(name, "SceGnmCompositor") ||
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
 }
@@ -526,6 +544,14 @@ scan_and_hook(void) {
     ptr += ki_structsize;
 
     if (pid <= 0 || is_system_proc(name)) continue;
+
+    /* Log de diagnostico: ver si el menu aparece en el barrido. */
+    if (strstr(name, "SceShell") != NULL) {
+      char l[160];
+      snprintf(l, sizeof(l), "Candidato menu: %s (pid=%d)", name, (int)pid);
+      logline(l);
+    }
+
     pstate_t *st = pstate_find(pid);
     if (st && st->done) continue;
 
@@ -554,8 +580,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller PASO 2 v12 (SIN ptrace: code cave + salto absoluto) ===");
-  notify("Activo (v12, sin ptrace). Pulsa L1+R1+R3 en el mando roto dentro del juego.");
+  logline("=== LeftStickKiller PASO 2 v13 (menú de consola + juego) ===");
+  notify("Activo (v13). Pulsa L1+R1+R3 en el menú o en el juego.");
 
   for (;;) {
     int n = scan_and_hook();
