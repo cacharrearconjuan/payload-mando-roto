@@ -58,7 +58,8 @@ jobs:
           path: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Publicar el .elf como Release descargable
-        if: github.event_name != 'pull_request'
+        # Solo publica el Release si estamos en la rama de trabajo principal
+        if: github.ref == 'refs/heads/claude/bold-cray-wrbrq2'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.v }}
