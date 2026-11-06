@@ -1,4 +1,4 @@
-/* LeftStickKiller - v1.0.0: hook sin ptrace + soporte menú y juego
+/* LeftStickKiller - v1.0.x: hook sin ptrace + soporte menú y juego
  *
  * Objetivo (accesibilidad): un DualSense con el stick izquierdo roto a nivel de
  * placa (deriva). Este payload engancha scePadReadState/scePadRead en el proceso
@@ -6,20 +6,13 @@
  * stick izquierdo en el centro (0x80,0x80) SOLO para el mando (handle) que haya
  * pulsado L1+R1+R3.
  *
- * CAMBIOS v1.0.0 respecto a v12:
+ * CAMBIOS respecto a v12:
  *   1. SceShellCore se ha ELIMINADO de is_system_proc. En PS5 el menú lee el
  *      pad a través de SceShellCore; vetarlo impedía enganchar el menú. Ahora
  *      se escanea y, si tiene libScePad.sprx, se le aplica el mismo hook.
  *   2. Log de diagnóstico: cada proceso cuyo nombre contenga "SceShell" se
  *      registra como "Candidato menu: ..." en /data/LeftStickKiller.log.
- *   3. Mensaje de notify actualizado para mencionar menú y juego.
- *
- * POR QUÉ SE QUITÓ PTRACE (v12):
- *   El log de v11 demostró que el cuelgue estaba en pt_mmap: reservaba memoria
- *   por ptrace haciendo single-step, y en 11.60 ese single-step no retornaba de
- *   forma fiable. v12 en adelante coloca el stub en un "code cave" (racha de
- *   0xCC entre funciones) y salta a él con mov rax,imm64;jmp rax. Todo con
- *   kernel_proc_copyin: estable, no puede colgar ni crashear el proceso.
+ *   3. Inclusión de version.h para sincronizar la versión con GitHub Actions.
  *
  * Licencia: GPLv3+. Ecosistema ps5-payload-dev.
  */
@@ -36,7 +29,13 @@
 #include <sys/sysctl.h>
 #include <sys/mman.h>
 
-#define LSK_VERSION "1.0.0"
+/* GitHub Actions genera este archivo durante la compilación */
+#if __has_include("version.h")
+#include "version.h"
+#else
+#define LSK_VERSION "v1.0.0-dev"
+#endif
+
 #define LOG_PATH    "/data/LeftStickKiller.log"
 #define PAD_STRIDE  0x78 /* sizeof(ScePadData) = 120 */
 
@@ -112,15 +111,7 @@ pstate_get(pid_t pid) {
 }
 
 /* Lista negra de procesos que NO queremos enganchar.
- *
- * v1.0.0: SceShellCore ya NO está en esta lista. En PS5 el menú de la consola
- * lee el pad a través de SceShellCore; si lo vetábamos, L1+R1+R3 no hacía nada
- * fuera del juego. Ahora se escanea como cualquier otro proceso. SceShellUI
- * nunca estuvo aquí, así que también se escanea.
- *
- * Si el log muestra "SceShellCore: sin code cave", el payload fallará LIMPIO
- * (no congela el menú). En ese caso habría que ampliar find_cave_any con más
- * librerías, pero es un caso poco probable. */
+ * SceShellCore ya NO está aquí para permitir enganchar el menú de la consola. */
 static bool
 is_system_proc(const char *name) {
   return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
@@ -569,8 +560,8 @@ scan_and_hook(void) {
 
 int
 main(void) {
-  logline("=== LeftStickKiller v" LSK_VERSION " (menu + juego) ===");
-  notify("Activo v" LSK_VERSION ". Pulsa L1+R1+R3 en el menú o en el juego.");
+  logline("=== LeftStickKiller " LSK_VERSION " (menu + juego) ===");
+  notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3 en el menu o en el juego.");
 
   for (;;) {
     int n = scan_and_hook();
