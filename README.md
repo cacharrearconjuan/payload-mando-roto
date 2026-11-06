@@ -1,102 +1,52 @@
 # LeftStickKiller
 
-Payload para **PS5 jailbreakeada** (firmware 11.60, cargador ELF de
-ps5-payload-dev en el puerto **9021**, **sin etaHEN**) para neutralizar el
-**stick izquierdo** roto de un DualSense concreto: cuando pulsas
-**L1 + R1 + R3** en ese mando, su stick izquierdo queda fijado en el centro
-(0x80) y deja de irse solo hacia la izquierda. Los otros mandos conectados
-siguen funcionando con normalidad.
+Payload para PS5 que soluciona la deriva (drift) del stick analógico izquierdo de un mando DualSense roto a nivel de hardware/placa.
 
-No es persistente: vive en segundo plano y **desaparece al apagar o reiniciar**.
+## ¿Qué hace?
 
-## Cómo funciona (PASO 2 — hook residente)
+Este payload engancha las funciones `scePadReadState` y `scePadRead` del sistema. Deja pasar la lectura real del mando, pero si detecta que has pulsado **L1 + R1 + R3**, fija los valores del **stick izquierdo en el centro (0x80, 0x80)** para ese mando específico. 
 
-`scePadReadState` es, en todos los procesos de 11.60, un *thunk* corto:
+- Solo afecta al mando con el que pulsaste la combinación. El resto de mandos, y el stick derecho, funcionan con normalidad.
+- **Funciona tanto dentro de los juegos como en el menú de la consola (SceShellCore / SceShellUI)**.
 
-```asm
-31 d2            xor edx, edx        ; contador = 0
-e9 89 eb ff ff   jmp  impl_real      ; salta a la implementación real
-```
+## ¿Cómo funciona internamente?
 
-El payload:
+A diferencia de las primeras versiones, este payload **NO utiliza `ptrace`** (lo cual causaba cuelgues en el firmware 11.60). En su lugar, utiliza una técnica de *hooking* mediante **code caves**:
+1. Busca una racha de bytes `0xCC` (espacio muerto seguro) dentro de `libScePad.sprx`.
+2. Escribe un *stub* (código ensamblador) que llama a la función real, comprueba si se ha pulsado L1+R1+R3, y si es así, modifica los bytes de salida.
+3. Parchea el inicio de `scePadReadState` y `scePadRead` con un salto relativo (`E9`) hacia nuestro *stub*.
 
-1. **Enumera procesos** (`KERN_PROC_ALL`) y localiza el del juego (tiene
-   `libScePad.sprx` y no es del sistema). Es **residente**: revisa cada pocos
-   segundos, así engancha el juego aunque lo abras después.
-2. Se engancha brevemente con **ptrace** (reutiliza `pt.c`/`pt.h` de
-   [ps5-payload-dev/elfldr](https://github.com/ps5-payload-dev/elfldr)),
-   reserva una página y, vía `kernel_mprotect`, la vuelve **RWX**.
-3. Escribe en esa página un **trampolín** (shellcode) que:
-   - llama a la implementación real de `scePadReadState`,
-   - si en esa lectura el mando tiene pulsado **L1+R1+R3** (`0xC04`), **marca
-     ese mando** por su *handle*,
-   - en toda lectura del mando marcado, fija `leftStick.x` y `leftStick.y` en
-     `0x80` (centro).
-4. Reescribe el *rel32* del `jmp` del thunk para que apunte al trampolín. El
-   `xor edx,edx` original se conserva (y el trampolín lo repite, así que es
-   autosuficiente).
+Esto es seguro, no congela el sistema y se replica correctamente en todos los procesos que compartan la librería.
 
-Es **autónomo por mando**: solo afecta al que pulsó la combinación. Mientras el
-hook esté puesto, el stick marcado queda centrado dentro del juego.
+## Instalación
 
-> Enganchar con ptrace **detiene el proceso del juego una fracción de
-> segundo** mientras se aplica el hook; es normal y se reanuda solo.
+### ⚠️ IMPORTANTE: No uses el `.elf` que está suelto en este repositorio.
+El archivo `.elf` que ves en la raíz del código es una **sonda de diagnóstico antigua (PASO 1)**. No es el payload funcional.
 
-### Historial
+Para obtener el payload real:
+1. Ve a la pestaña **Releases** de este repositorio (a la derecha).
+2. Descarga el archivo `LeftStickKiller-v1.0.X.elf` de la sección **Assets** de la última release.
 
-- **PASO 1 / 1b** (sonda de solo lectura): localizó `scePadReadState` en los
-  procesos y volcó sus bytes. Confirmó que en 11.60 el acceso de kernel, la
-  resolución de símbolos y el `copyout`/`copyin` entre procesos funcionan, y
-  que el thunk es idéntico en todos. (Queda en el historial de git.)
-- **PASO 2** (esto): el hook real descrito arriba.
+### Cómo cargarlo en la PS5
+1. Envía el ELF a tu PS5.
+2. **Recomendado:** Cárgalo desde el botón "Cargar ELF" de la interfaz de **Payload Manager**. Esto te permitirá verlo en la lista de procesos y cerrarlo (matarlo) cuando quieras, igual que el resto de payloads.
+3. Alternativa: Por red con `nc -q0 <IP_PS5> 9021 < LeftStickKiller-v1.0.X.elf` (nota: si lo haces así, no aparecerá como proceso independiente en Payload Manager).
 
-## Conseguir el `.elf`
+## Uso
 
-> El `.elf` de confianza es el **artefacto de GitHub Actions**, no el binario
-> que pueda haber commiteado en el repo (ese puede quedar desfasado).
+1. Enciende la PS5 y carga el payload.
+2. Abre un juego o quédate en el menú de la consola.
+3. Pulsa **L1 + R1 + R3** en el mando roto. Verás una notificación de confirmación.
+4. A partir de ese momento, el stick izquierdo de ese mando se quedará fijo en el centro (ignorará la deriva física).
 
-Cada push compila el payload. Entra en la pestaña **Actions**, abre la
-compilación más reciente, espera el tic verde y descarga el artefacto
-`LeftStickKiller` (un zip con `LeftStickKiller.elf`). También se publica en la
-Release `latest`.
+## Log de diagnóstico
 
-Compilarlo tú mismo:
+El payload escribe un registro en `/data/LeftStickKiller.log`. Puedes acceder a él por FTP para ver qué está pasando. Si algo falla, busca líneas como `"HOOK OK"` o `"sin code cave"`.
 
-```console
-wget https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
-sudo unzip -d /opt ps5-payload-sdk.zip
+## Compilación (para desarrolladores)
+
+Requiere el [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk).
+
+```bash
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 make
-```
-
-## Cargar y usar
-
-1. Carga el payload con el cargador ELF en el puerto 9021:
-
-   ```console
-   nc -q0 <IP_de_tu_PS5> 9021 < LeftStickKiller.elf
-   ```
-
-2. Aparece *"Activo. Abre el juego..."*. Abre el juego (o déjalo ya abierto).
-3. Cuando el hook se aplica, aparece *"Hook aplicado en N proceso(s)"*.
-4. **Dentro del juego**, en el mando roto, pulsa **L1 + R1 + R3**. A partir de
-   ese momento su stick izquierdo queda centrado.
-
-Si algo va raro, el payload deja un informe en **`/data/LeftStickKiller.log`**
-(recupéralo, por ejemplo, con un payload FTP como
-[ftpsrv](https://github.com/ps5-payload-dev/ftpsrv)).
-
-### Límites / notas
-
-- Si `scePadReadState` no es el thunk esperado en tu firmware, el payload
-  **no toca nada** en ese proceso y lo anota en el log.
-- El trampolín usa un `jmp rel32`; si la página reservada cayera a más de 2 GiB
-  del thunk, el hook **aborta en vez de arriesgar** (queda anotado).
-- La marca de "mando centrado" dura mientras el proceso del juego vive. Al
-  cerrar el juego o reiniciar, desaparece todo.
-
-## Licencia
-
-GPLv3+. Parte del ecosistema
-[ps5-payload-dev](https://github.com/ps5-payload-dev). `pt.c`/`pt.h` son de
-John Törnblom (elfldr), GPLv3+.
