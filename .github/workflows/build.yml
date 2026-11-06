@@ -10,8 +10,8 @@ permissions:
 
 jobs:
   build:
-    # Ubuntu 22.04 LTS: estable, sin los problemas de red de ubuntu-26.04
-    runs-on: ubuntu-22.04
+    # Ubuntu 24.04 LTS: incluye clang-18 y lld-18 en los repos oficiales
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +43,6 @@ jobs:
           path: LeftStickKiller.elf
 
       - name: Publicar el .elf como Release descargable
-        # Se ejecuta en push y en ejecución manual, pero NO en Pull Requests
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
