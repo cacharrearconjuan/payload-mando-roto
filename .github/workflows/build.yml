@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para contar todos los commits
+          fetch-depth: 0 # CRUCIAL: Descarga todas las etiquetas para saber la última versión
 
       - name: Instalar dependencias
         run: |
@@ -27,16 +27,28 @@ jobs:
           wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
           sudo unzip -q -d /opt ps5-payload-sdk.zip
 
-      - name: Calcular version (1.0.<nº de commits>)
+      - name: Calcular version (Auto-incremento)
         id: ver
         run: |
-          # Cuenta el número de commits reales. Sube solo cuando tú subes código.
-          COMMITS=$(git rev-list --count HEAD)
-          echo "v=1.0.$COMMITS" >> "$GITHUB_OUTPUT"
+          # Busca la etiqueta más alta que empiece por v1.0. (ej: v1.0.59)
+          LATEST_TAG=$(git tag -l "v1.0.*" | sort -V | tail -n 1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            # Si no hay ninguna, empezamos en la 0
+            NEW_VERSION="1.0.0"
+          else
+            # Extrae el número, le suma 1 y crea la nueva versión
+            PATCH=${LATEST_TAG#v1.0.}
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="1.0.$PATCH"
+          fi
+          
+          echo "v=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Nueva versión calculada: v$NEW_VERSION"
 
       - name: Generar version.h
         run: |
-          # Esto inyecta la versión correcta dentro del .elf
+          # Inyecta la versión en el código para que el log de PS5 coincida
           echo '#define LSK_VERSION "v${{ steps.ver.outputs.v }}"' > version.h
 
       - name: Compilar el payload
@@ -46,7 +58,6 @@ jobs:
 
       - name: Renombrar el .elf con la version
         run: |
-          # El fichero se llamará LeftStickKiller-v1.0.X.elf
           mv LeftStickKiller.elf LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Subir el .elf como artefacto
@@ -72,4 +83,5 @@ jobs:
             `nc -q0 <IP_PS5> 9021 < LeftStickKiller-v${{ steps.ver.outputs.v }}.elf`
           files: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
           draft: false
-          prerelease: true
+          prerelease: false     # <--- ESTO QUITA EL CARTEL DE PRE-RELEASE
+          make_latest: true     # <--- ESTO FUERZA LA ETIQUETA VERDE "LATEST"
