@@ -1,4 +1,4 @@
-/* LeftStickKiller - v1.0.x: Solución definitiva estable */
+/* LeftStickKiller - v1.0.x: Búsqueda inteligente de code caves con fallback */
 
 #include <ps5/kernel.h>
 
@@ -78,7 +78,9 @@ static pstate_t *pstate_get(pid_t pid) {
 }
 
 static bool is_system_proc(const char *name) {
-  return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
+  /* De momento SceShellCore está aquí para probar SOLO en el juego sin riesgo */
+  return !strcmp(name, "SceShellCore")  || 
+         !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
          !strcmp(name, "SceSysCore")    || !strcmp(name, "SceGnmCompositor") ||
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
 }
@@ -167,28 +169,27 @@ static const uint8_t stub_single_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-/* El bucle usa EDX como contador para preservar el valor de retorno en EAX */
 static const uint8_t stub_array_tail[] = {
-  0x89, 0xC2,                               /* mov edx, eax            */
-  0x83, 0xFA, 0x04,                         /* cmp edx, 4              */
-  0x7E, 0x05,                               /* jle +5                  */
-  0xBA, 0x04, 0x00, 0x00, 0x00,             /* mov edx, 4              */
-  0x85, 0xD2,                               /* test edx, edx           */
-  0x7E, 0x30,                               /* jle +0x30 (done_loop)   */
-  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
-  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
-  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
-  0x75, 0x07,                               /* jne skip_lock (+7)      */
-  0x44, 0x89, 0x25, 0x20, 0x00, 0x00, 0x00, /* mov dword [rip+0x20], r12d */
-  0x44, 0x3B, 0x25, 0x19, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x19] */
-  0x75, 0x08,                               /* jne next_iter (+8)      */
-  0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
-  0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
-  0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           */
-  0xFF, 0xCA,                               /* dec edx                 */
-  0x75, 0xD0,                               /* jnz -0x30 (loop_start)  */
-  0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,       /* pop r13, pop r12, pop rbx, ret */
-  0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
+  0x89, 0xC2,                               /* mov edx, eax            (0) */
+  0x83, 0xFA, 0x04,                         /* cmp edx, 4              (2) */
+  0x7E, 0x05,                               /* jle +5                  (5) */
+  0xBA, 0x04, 0x00, 0x00, 0x00,             /* mov edx, 4              (7) */
+  0x85, 0xD2,                               /* test edx, edx           (12) */
+  0x7E, 0x30,                               /* jle +0x30 (done_loop)   (14) */
+  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    (16) */
+  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          (18) */
+  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          (24) */
+  0x75, 0x07,                               /* jne skip_lock (+7)      (30) */
+  0x44, 0x89, 0x25, 0x1F, 0x00, 0x00, 0x00, /* mov dword [rip+0x1F], r12d (32) */
+  0x44, 0x3B, 0x25, 0x18, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x18] (39) */
+  0x75, 0x08,                               /* jne next_iter (+8)      (46) */
+  0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  (48) */
+  0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  (52) */
+  0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           (56) */
+  0xFF, 0xCA,                               /* dec edx                 (60) */
+  0x75, 0xD0,                               /* jnz -0x30 (loop_start)  (62) */
+  0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,       /* pop r13, pop r12, pop rbx, ret (64) */
+  0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   (70) */
 };
 
 #define STUB_MAX (sizeof(endbr64_pre) + MAX_PRO + sizeof(stub_hdr) + 5 + sizeof(stub_array_tail))
@@ -202,7 +203,6 @@ static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t 
   memcpy(sc + n, stub_hdr, sizeof(stub_hdr));
   n += sizeof(stub_hdr);
 
-  /* Llamada RELATIVA (E8 rel32) */
   int32_t rel = (int32_t)(impl - (cave + n + 5));
   sc[n] = 0xE8;
   memcpy(sc + n + 1, &rel, 4);
@@ -222,25 +222,56 @@ static bool is_hooked_thunk(const uint8_t *h) {
   return h[0] == 0xE9;
 }
 
-/* Búsqueda de cave: 2MB antes y 16MB después (cubre cabeceras y código) */
+/* Búsqueda de code cave: Solo en páginas ejecutables, acepta 0xCC y 0x00, con margen */
 static intptr_t find_code_cave(pid_t pid, intptr_t start, size_t need) {
   uint8_t chunk[0x1000];
   intptr_t run_start = 0;
   size_t run_len = 0;
-  intptr_t addr = (start - 0x200000) & ~((intptr_t)0xFFF);
-  intptr_t limit = start + 0x1000000;
-  
-  for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
-    if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
-      run_len = 0; continue;
+  uint8_t run_byte = 0;
+  intptr_t addr = start & ~((intptr_t)0xFFF);
+  intptr_t limit = addr + 0x1000000;
+
+  for (; addr < limit; addr += 0x1000) {
+    int prot = kernel_get_vmem_protection(pid, addr, 0x1000);
+    if (prot < 0 || !(prot & PROT_EXEC) || kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
+      run_len = 0;
+      continue;
     }
     for (size_t i = 0; i < sizeof(chunk); i++) {
-      if (chunk[i] == 0xCC) {
-        if (run_len == 0) run_start = addr + (intptr_t)i;
-        run_len++;
-        if (run_len >= need) return run_start;
-      } else {
+      uint8_t b = chunk[i];
+      if (b != 0xCC && b != 0x00) {
         run_len = 0;
+        continue;
+      }
+      if (run_len == 0 || b != run_byte) {
+        run_start = addr + (intptr_t)i;
+        run_byte = b;
+        run_len = 0;
+      }
+      if (++run_len >= need + 16) return run_start + 8;
+    }
+  }
+  return 0;
+}
+
+/* Fallback: busca en libScePad y si falla, en otras librerías */
+static intptr_t find_cave_any(pid_t pid, intptr_t mapbase, size_t need) {
+  intptr_t cave = find_code_cave(pid, mapbase, need);
+  if (cave) return cave;
+
+  static const char *libs[] = {
+    "libc.sprx", "libSceLibcInternal.sprx", "libkernel.sprx",
+    "libkernel_web.sprx", "libkernel_sys.sprx", "libSceSysmodule.sprx",
+  };
+  for (size_t i = 0; i < sizeof(libs) / sizeof(libs[0]); i++) {
+    uint32_t h = 0;
+    if (kernel_dynlib_handle(pid, libs[i], &h) != 0 || !h) continue;
+    intptr_t base = kernel_dynlib_mapbase_addr(pid, h);
+    if (base > 0) {
+      cave = find_code_cave(pid, base, need);
+      if (cave) {
+        char l[128]; snprintf(l, sizeof(l), "  Cave encontrado en fallback: %s", libs[i]); logline(l);
+        return cave;
       }
     }
   }
@@ -291,12 +322,21 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, 0, is_array);
 
-  logline("  paso1: buscando code cave cercano");
-  intptr_t cave = find_code_cave(pid, mapbase, sclen);
+  logline("  paso1: buscando code cave con validacion");
+  intptr_t cave = find_cave_any(pid, mapbase, sclen);
   if (!cave) {
     char l[96]; snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen); logline(l);
     return -1;
   }
+  
+  int64_t d  = (int64_t)cave - (int64_t)(addr + 5);
+  int64_t dc = (int64_t)impl - (int64_t)cave;
+  if (d > INT32_MAX || d < INT32_MIN || dc > 0x7FFF0000 || dc < -0x7FFF0000) {
+    char l[128]; snprintf(l, sizeof(l), "  %s: cave demasiado lejos para E9", sym); logline(l);
+    return -1;
+  }
+  int32_t rel_cave = (int32_t)d;
+
   {
     char l[96]; snprintf(l, sizeof(l), "  paso2: cave encontrado en 0x%lx", (unsigned long)cave); logline(l);
   }
@@ -305,7 +345,7 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
 
   int cp = kernel_get_vmem_protection(pid, cave, sclen);
   if (cp < 0 || !(cp & PROT_EXEC)) {
-    char l[128]; snprintf(l, sizeof(l), "  %s: cave en 0x%lx no es ejecutable, descartado", sym, (unsigned long)cave); logline(l);
+    char l[128]; snprintf(l, sizeof(l), "  %s: cave no ejecutable (red de seguridad)", sym); logline(l);
     return -1;
   }
   if (kernel_mprotect(pid, cave, sclen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -322,7 +362,6 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
 
   uint8_t patch[5];
   patch[0] = 0xE9;
-  int32_t rel_cave = (int32_t)(cave - (addr + 5));
   memcpy(patch + 1, &rel_cave, 4);
 
   int op = kernel_get_vmem_protection(pid, addr, sizeof(patch));
@@ -451,8 +490,8 @@ int main(void) {
     sleep(1);
   }
 
-  logline("=== LeftStickKiller " LSK_VERSION " (menu + juego) ===");
-  notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3 en el menu o en el juego.");
+  logline("=== LeftStickKiller " LSK_VERSION " (Prueba en juego) ===");
+  notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3.");
 
   for (;;) {
     int n = scan_and_hook();
