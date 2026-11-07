@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # necesario para leer los tags v1.0.* y auto-incrementar
 
       - name: Instalar dependencias
         run: |
@@ -29,20 +31,38 @@ jobs:
           export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
           make
 
+      - name: Calcular version (auto-incremento v1.0.x)
+        id: ver
+        run: |
+          LATEST_TAG=$(git tag -l "v1.0.*" | sort -V | tail -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_VERSION="1.0.0"
+          else
+            PATCH=${LATEST_TAG#v1.0.}
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="1.0.$PATCH"
+          fi
+          echo "v=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Nueva version calculada: v$NEW_VERSION"
+
+      - name: Renombrar el .elf con la version
+        run: mv LeftStickKiller.elf LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
+
       - name: Subir el .elf como artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: LeftStickKiller
-          path: LeftStickKiller.elf
+          name: LeftStickKiller-v${{ steps.ver.outputs.v }}
+          path: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Publicar el .elf como Release descargable
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Ultima compilacion (LeftStickKiller.elf)
+          tag_name: v${{ steps.ver.outputs.v }}
+          name: LeftStickKiller v${{ steps.ver.outputs.v }}
           body: |
             Compilacion automatica de LeftStickKiller.elf desde la rama de trabajo.
             Descarga el .elf de aqui abajo (en Assets) y cargalo en la PS5:
-            nc -q0 <IP_PS5> 9021 < LeftStickKiller.elf
-          files: LeftStickKiller.elf
+            nc -q0 <IP_PS5> 9021 < LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
+          files: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
+          make_latest: true
