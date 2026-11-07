@@ -10,23 +10,28 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # necesario para leer los tags v1.0.* y auto-incrementar
 
       - name: Instalar dependencias
         run: |
-          sudo apt-get update -o Acquire::Retries=5
-          sudo apt-get install -y --no-install-recommends clang-18 lld-18 wget unzip
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 wget unzip
 
       - name: Instalar el ps5-payload-sdk
         run: |
           wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
           sudo unzip -q -d /opt ps5-payload-sdk.zip
 
-      - name: Calcular version (Auto-incremento)
+      - name: Compilar el payload
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make
+
+      - name: Calcular version (auto-incremento v1.0.x)
         id: ver
         run: |
           LATEST_TAG=$(git tag -l "v1.0.*" | sort -V | tail -n 1)
@@ -38,15 +43,7 @@ jobs:
             NEW_VERSION="1.0.$PATCH"
           fi
           echo "v=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Nueva versión calculada: v$NEW_VERSION"
-
-      - name: Generar version.h
-        run: echo '#define LSK_VERSION "v${{ steps.ver.outputs.v }}"' > version.h
-
-      - name: Compilar el payload
-        run: |
-          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-          make
+          echo "Nueva version calculada: v$NEW_VERSION"
 
       - name: Renombrar el .elf con la version
         run: mv LeftStickKiller.elf LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
@@ -58,22 +55,14 @@ jobs:
           path: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
 
       - name: Publicar el .elf como Release descargable
-        # Solo publica el Release si estamos en la rama de trabajo principal
-        if: github.ref == 'refs/heads/claude/bold-cray-wrbrq2'
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.v }}
           name: LeftStickKiller v${{ steps.ver.outputs.v }}
           body: |
-            Compilación automática de LeftStickKiller.elf
-            Rama: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Versión: v${{ steps.ver.outputs.v }}
-
-            Descarga el `.elf` de Assets y cárgalo en la PS5
-            desde Payload Manager (recomendado) o con:
-            `nc -q0 <IP_PS5> 9021 < LeftStickKiller-v${{ steps.ver.outputs.v }}.elf`
+            Compilacion automatica de LeftStickKiller.elf desde la rama de trabajo.
+            Descarga el .elf de aqui abajo (en Assets) y cargalo en la PS5:
+            nc -q0 <IP_PS5> 9021 < LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
           files: LeftStickKiller-v${{ steps.ver.outputs.v }}.elf
-          draft: false
-          prerelease: false
           make_latest: true
