@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <signal.h>
 
 #if __has_include("version.h")
 #include "version.h"
@@ -418,7 +420,41 @@ static int scan_and_hook(void) {
   return new_hooks;
 }
 
+#define PROC_NAME "LeftStickKiller.elf"
+
+/* Busca otra instancia ya cargada con el mismo nombre (como hace ftpsrv). */
+static pid_t find_other_instance(void) {
+  int mib[4] = {1, 14, 8, 0};
+  pid_t me = getpid(), found = -1;
+  size_t sz = 0;
+  if (sysctl(mib, 4, 0, &sz, 0, 0) != 0) return -1;
+  uint8_t *buf = malloc(sz);
+  if (!buf) return -1;
+  if (sysctl(mib, 4, buf, &sz, 0, 0) != 0) { free(buf); return -1; }
+  for (uint8_t *ptr = buf; ptr < buf + sz;) {
+    int ki_structsize = *(int *)ptr;
+    if (ki_structsize <= 0) break;
+    pid_t pid = *(pid_t *)&ptr[KINFO_PID_OFF];
+    const char *name = (const char *)&ptr[KINFO_NAME_OFF];
+    ptr += ki_structsize;
+    if (pid != me && !strcmp(name, PROC_NAME)) found = pid;
+  }
+  free(buf);
+  return found;
+}
+
 int main(void) {
+  /* Nombre visible en Payload Manager (en vez de payload.elf) */
+  syscall(SYS_thr_set_name, -1, PROC_NAME);
+
+  /* Si ya habia una copia cargada, se cierra para no tener dos */
+  pid_t old;
+  int guard = 0;
+  while ((old = find_other_instance()) > 0 && guard++ < 10) {
+    kill(old, SIGKILL);
+    sleep(1);
+  }
+
   logline("=== LeftStickKiller " LSK_VERSION " (menu + juego) ===");
   notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3 en el menu o en el juego.");
 
