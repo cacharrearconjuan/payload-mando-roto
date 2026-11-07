@@ -78,10 +78,8 @@ static pstate_t *pstate_get(pid_t pid) {
 }
 
 static bool is_system_proc(const char *name) {
-  /* SceShellCore está aquí para probar SOLO en el juego sin riesgo.
-     Una vez confirmado, quita esta línea para que funcione también en el menú. */
-  return !strcmp(name, "SceShellCore")  || 
-         !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
+  /* Eliminamos SceShellCore para que funcione también en el menú */
+  return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
          !strcmp(name, "SceSysCore")    || !strcmp(name, "SceGnmCompositor") ||
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
 }
@@ -183,8 +181,8 @@ static const uint8_t stub_array_tail[] = {
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          (21) */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          (27) */
   0x75, 0x07,                               /* jne skip_lock (+7)      (33) */
-  0x44, 0x89, 0x2D, 0x1B, 0x00, 0x00, 0x00, /* mov dword [rip+0x1B], r13d (35) */
-  0x44, 0x3B, 0x2D, 0x14, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x14] (42) */
+  0x44, 0x89, 0x2D, 0x22, 0x00, 0x00, 0x00, /* mov dword [rip+0x22], r13d (35) CORREGIDO */
+  0x44, 0x3B, 0x2D, 0x1B, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x1B] (42) CORREGIDO */
   0x75, 0x08,                               /* jne next_iter (+8)      (49) */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  (51) */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  (55) */
@@ -528,7 +526,7 @@ int main(void) {
     sleep(1);
   }
 
-  logline("=== LeftStickKiller " LSK_VERSION " (Prueba en juego) ===");
+  logline("=== LeftStickKiller " LSK_VERSION " (Menu + Juego) ===");
   notify("Activo " LSK_VERSION ". Pulsa L1+R1+R3.");
 
   for (;;) {
