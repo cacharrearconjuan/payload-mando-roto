@@ -1,4 +1,4 @@
-/* LeftStickKiller - v1.0.x: Base estable (v12) + Soporte Menú PS5 */
+/* LeftStickKiller - v1.0.x: Base v12 + Soporte Menú (Offsets corregidos) */
 
 #include <ps5/kernel.h>
 
@@ -78,7 +78,7 @@ static pstate_t *pstate_get(pid_t pid) {
 }
 
 static bool is_system_proc(const char *name) {
-  /* SceShellCore eliminado para que funcione también en el menú */
+  /* Eliminamos SceShellCore para que funcione también en el menú */
   return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
          !strcmp(name, "SceSysCore")    || !strcmp(name, "SceGnmCompositor") ||
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
@@ -154,14 +154,14 @@ static const uint8_t stub_hdr[] = {
   0x49, 0x89, 0xFC,             /* mov  r12, rdi           */
 };
 
-/* Mantenemos el stub single de v12 (offsets 0x17 y 0x10) */
+/* Stub single: offsets CORREGIDOS (0x18 y 0x11) */
 static const uint8_t stub_single_tail[] = {
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          */
   0x75, 0x07,                               /* jne skip_lock (+7)      */
-  0x44, 0x89, 0x25, 0x17, 0x00, 0x00, 0x00, /* mov dword [rip+0x17], r12d */
-  0x44, 0x3B, 0x25, 0x10, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x10] */
+  0x44, 0x89, 0x25, 0x18, 0x00, 0x00, 0x00, /* mov dword [rip+0x18], r12d */
+  0x44, 0x3B, 0x25, 0x11, 0x00, 0x00, 0x00, /* cmp r12d, dword [rip+0x11] */
   0x75, 0x08,                               /* jne done (+8)           */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
@@ -169,7 +169,7 @@ static const uint8_t stub_single_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-/* Stub array corregido: usa r13d para el índice y offsets exactos (0x23 y 0x1C) */
+/* Stub array: offsets CORREGIDOS (0x23 y 0x1C) */
 static const uint8_t stub_array_tail[] = {
   0x50,                                     /* push rax                (0) */
   0x83, 0xF8, 0x40,                         /* cmp eax, 64             (1) */
@@ -182,8 +182,8 @@ static const uint8_t stub_array_tail[] = {
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          (20) */
   0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          (26) */
   0x75, 0x07,                               /* jne skip_lock (+7)      (32) */
-  0x44, 0x89, 0x2D, 0x23, 0x00, 0x00, 0x00, /* mov dword [rip+0x23], r13d (34) CORREGIDO */
-  0x44, 0x3B, 0x2D, 0x1C, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x1C] (41) CORREGIDO */
+  0x44, 0x89, 0x2D, 0x23, 0x00, 0x00, 0x00, /* mov dword [rip+0x23], r13d (34) */
+  0x44, 0x3B, 0x2D, 0x1C, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x1C] (41) */
   0x75, 0x08,                               /* jne next_iter (+8)      (48) */
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  (50) */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  (54) */
@@ -207,7 +207,6 @@ static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t 
   memcpy(sc + n, stub_hdr, sizeof(stub_hdr));
   n += sizeof(stub_hdr);
 
-  /* Llamada relativa al impl original */
   int32_t rel = (int32_t)(impl - (cave + n + 5));
   sc[n] = 0xE8;
   memcpy(sc + n + 1, &rel, 4);
@@ -227,7 +226,6 @@ static bool is_hooked_thunk(const uint8_t *h) {
   return h[0] == 0xE9;
 }
 
-/* Búsqueda de code cave robusta (páginas ejecutables, 0xCC y 0x00) */
 static intptr_t find_code_cave(pid_t pid, intptr_t start, size_t need) {
   uint8_t chunk[0x1000];
   intptr_t run_start = 0;
