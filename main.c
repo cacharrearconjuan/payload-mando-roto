@@ -1,4 +1,4 @@
-/* LeftStickKiller - v1.0.x: hook relativo estable, soporte menú y juego */
+/* LeftStickKiller - v1.0.x: Solución definitiva estable */
 
 #include <ps5/kernel.h>
 
@@ -167,12 +167,13 @@ static const uint8_t stub_single_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
+/* El bucle usa EDX como contador para preservar el valor de retorno en EAX */
 static const uint8_t stub_array_tail[] = {
-  0x50,                                     /* push rax                */
-  0x83, 0xF8, 0x04,                         /* cmp eax, 4              */
+  0x89, 0xC2,                               /* mov edx, eax            */
+  0x83, 0xFA, 0x04,                         /* cmp edx, 4              */
   0x7E, 0x05,                               /* jle +5                  */
-  0xB8, 0x04, 0x00, 0x00, 0x00,             /* mov eax, 4              */
-  0x85, 0xC0,                               /* test eax, eax           */
+  0xBA, 0x04, 0x00, 0x00, 0x00,             /* mov edx, 4              */
+  0x85, 0xD2,                               /* test edx, edx           */
   0x7E, 0x30,                               /* jle +0x30 (done_loop)   */
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
@@ -184,9 +185,8 @@ static const uint8_t stub_array_tail[] = {
   0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  */
   0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  */
   0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           */
-  0xFF, 0xC8,                               /* dec eax                 */
+  0xFF, 0xCA,                               /* dec edx                 */
   0x75, 0xD0,                               /* jnz -0x30 (loop_start)  */
-  0x58,                                     /* pop rax                 */
   0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,       /* pop r13, pop r12, pop rbx, ret */
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
@@ -222,13 +222,13 @@ static bool is_hooked_thunk(const uint8_t *h) {
   return h[0] == 0xE9;
 }
 
-/* Búsqueda restringida a libScePad */
+/* Búsqueda de cave: 2MB antes y 16MB después (cubre cabeceras y código) */
 static intptr_t find_code_cave(pid_t pid, intptr_t start, size_t need) {
   uint8_t chunk[0x1000];
   intptr_t run_start = 0;
   size_t run_len = 0;
-  intptr_t addr = start & ~((intptr_t)0xFFF);
-  intptr_t limit = addr + 0x1000000;
+  intptr_t addr = (start - 0x200000) & ~((intptr_t)0xFFF);
+  intptr_t limit = start + 0x1000000;
   
   for (; addr < limit; addr += (intptr_t)sizeof(chunk)) {
     if (kernel_proc_copyout(pid, addr, chunk, sizeof(chunk)) != 0) {
@@ -291,7 +291,7 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
   uint8_t sc[STUB_MAX];
   size_t sclen = build_stub(sc, &t, impl, 0, is_array);
 
-  logline("  paso1: buscando code cave en libScePad");
+  logline("  paso1: buscando code cave cercano");
   intptr_t cave = find_code_cave(pid, mapbase, sclen);
   if (!cave) {
     char l[96]; snprintf(l, sizeof(l), "  %s: sin code cave de %u bytes", sym, (unsigned)sclen); logline(l);
@@ -301,7 +301,7 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
     char l[96]; snprintf(l, sizeof(l), "  paso2: cave encontrado en 0x%lx", (unsigned long)cave); logline(l);
   }
 
-  sclen = build_stub(sc, &t, impl, cave, is_array); /* Re-generar con el cave real */
+  sclen = build_stub(sc, &t, impl, cave, is_array);
 
   int cp = kernel_get_vmem_protection(pid, cave, sclen);
   if (cp < 0 || !(cp & PROT_EXEC)) {
@@ -398,7 +398,6 @@ static int scan_and_hook(void) {
     pstate_t *st = pstate_find(pid);
     if (st && st->done) continue;
 
-    /* Log una sola vez por proceso */
     if (!st && strstr(name, "SceShell") != NULL) {
       char l[160]; snprintf(l, sizeof(l), "Candidato menu: %s (pid=%d)", name, (int)pid); logline(l);
     }
@@ -422,7 +421,6 @@ static int scan_and_hook(void) {
 
 #define PROC_NAME "LeftStickKiller.elf"
 
-/* Busca otra instancia ya cargada con el mismo nombre (como hace ftpsrv). */
 static pid_t find_other_instance(void) {
   int mib[4] = {1, 14, 8, 0};
   pid_t me = getpid(), found = -1;
@@ -444,10 +442,8 @@ static pid_t find_other_instance(void) {
 }
 
 int main(void) {
-  /* Nombre visible en Payload Manager (en vez de payload.elf) */
   syscall(SYS_thr_set_name, -1, PROC_NAME);
 
-  /* Si ya habia una copia cargada, se cierra para no tener dos */
   pid_t old;
   int guard = 0;
   while ((old = find_other_instance()) > 0 && guard++ < 10) {
