@@ -1,4 +1,4 @@
-/* LeftStickKiller - v1.0.x: Hook estable con soporte para menú y juego */
+/* LeftStickKiller - v1.0.x: Base estable (v12) + Soporte Menú PS5 */
 
 #include <ps5/kernel.h>
 
@@ -78,7 +78,7 @@ static pstate_t *pstate_get(pid_t pid) {
 }
 
 static bool is_system_proc(const char *name) {
-  /* Eliminamos SceShellCore para que funcione también en el menú */
+  /* SceShellCore eliminado para que funcione también en el menú */
   return !strcmp(name, "SceRedisServer")|| !strcmp(name, "SceSysCore.elf") ||
          !strcmp(name, "SceSysCore")    || !strcmp(name, "SceGnmCompositor") ||
          !strcmp(name, "SceRemotePlay") || !strcmp(name, "SceJSCd");
@@ -154,6 +154,7 @@ static const uint8_t stub_hdr[] = {
   0x49, 0x89, 0xFC,             /* mov  r12, rdi           */
 };
 
+/* Mantenemos el stub single de v12 (offsets 0x17 y 0x10) */
 static const uint8_t stub_single_tail[] = {
   0x8B, 0x0B,                               /* mov ecx, dword [rbx]    */
   0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          */
@@ -168,28 +169,29 @@ static const uint8_t stub_single_tail[] = {
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_handle inicial   */
 };
 
-/* El bucle usa R13D como índice para no afectar a otros mandos */
+/* Stub array corregido: usa r13d para el índice y offsets exactos (0x23 y 0x1C) */
 static const uint8_t stub_array_tail[] = {
-  0x89, 0xC2,                               /* mov edx, eax            (0) */
-  0x83, 0xFA, 0x04,                         /* cmp edx, 4              (2) */
-  0x7E, 0x05,                               /* jle +5                  (5) */
-  0xBA, 0x04, 0x00, 0x00, 0x00,             /* mov edx, 4              (7) */
-  0x85, 0xD2,                               /* test edx, edx           (12) */
-  0x7E, 0x36,                               /* jle +0x36 (done_loop)   (14) */
-  0x45, 0x31, 0xED,                         /* xor r13d, r13d          (16) */
-  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    (19) */
-  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          (21) */
-  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          (27) */
-  0x75, 0x07,                               /* jne skip_lock (+7)      (33) */
-  0x44, 0x89, 0x2D, 0x22, 0x00, 0x00, 0x00, /* mov dword [rip+0x22], r13d (35) CORREGIDO */
-  0x44, 0x3B, 0x2D, 0x1B, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x1B] (42) CORREGIDO */
-  0x75, 0x08,                               /* jne next_iter (+8)      (49) */
-  0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  (51) */
-  0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  (55) */
-  0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           (59) */
-  0x41, 0xFF, 0xC5,                         /* inc r13d                (63) */
-  0xFF, 0xCA,                               /* dec edx                 (66) */
-  0x75, 0xCA,                               /* jnz -0x36 (loop_start)  (68) */
+  0x50,                                     /* push rax                (0) */
+  0x83, 0xF8, 0x40,                         /* cmp eax, 64             (1) */
+  0x7E, 0x05,                               /* jle +5                  (4) */
+  0xB8, 0x40, 0x00, 0x00, 0x00,             /* mov eax, 64             (6) */
+  0x85, 0xC0,                               /* test eax, eax           (11) */
+  0x7E, 0x36,                               /* jle +0x36 (done_loop)   (13) */
+  0x45, 0x31, 0xED,                         /* xor r13d, r13d          (15) */
+  0x8B, 0x0B,                               /* mov ecx, dword [rbx]    (18) */
+  0x81, 0xE1, 0x04, 0x0C, 0x00, 0x00,       /* and ecx, 0xC04          (20) */
+  0x81, 0xF9, 0x04, 0x0C, 0x00, 0x00,       /* cmp ecx, 0xC04          (26) */
+  0x75, 0x07,                               /* jne skip_lock (+7)      (32) */
+  0x44, 0x89, 0x2D, 0x23, 0x00, 0x00, 0x00, /* mov dword [rip+0x23], r13d (34) CORREGIDO */
+  0x44, 0x3B, 0x2D, 0x1C, 0x00, 0x00, 0x00, /* cmp r13d, dword [rip+0x1C] (41) CORREGIDO */
+  0x75, 0x08,                               /* jne next_iter (+8)      (48) */
+  0xC6, 0x43, 0x04, 0x80,                   /* mov byte [rbx+4], 0x80  (50) */
+  0xC6, 0x43, 0x05, 0x80,                   /* mov byte [rbx+5], 0x80  (54) */
+  0x48, 0x83, 0xC3, 0x78,                   /* add rbx, 0x78           (58) */
+  0x41, 0xFF, 0xC5,                         /* inc r13d                (62) */
+  0xFF, 0xC8,                               /* dec eax                 (65) */
+  0x75, 0xCA,                               /* jnz -0x36 (loop_start)  (67) */
+  0x58,                                     /* pop rax                 (69) */
   0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,       /* pop r13, pop r12, pop rbx, ret (70) */
   0xFF, 0xFF, 0xFF, 0xFF                    /* locked_index inicial   (76) */
 };
@@ -205,6 +207,7 @@ static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t 
   memcpy(sc + n, stub_hdr, sizeof(stub_hdr));
   n += sizeof(stub_hdr);
 
+  /* Llamada relativa al impl original */
   int32_t rel = (int32_t)(impl - (cave + n + 5));
   sc[n] = 0xE8;
   memcpy(sc + n + 1, &rel, 4);
@@ -220,7 +223,11 @@ static size_t build_stub(uint8_t *sc, const thunk_t *t, intptr_t impl, intptr_t 
   return n;
 }
 
-/* Busca una racha de 0xCC o 0x00 SOLO en páginas ejecutables. */
+static bool is_hooked_thunk(const uint8_t *h) {
+  return h[0] == 0xE9;
+}
+
+/* Búsqueda de code cave robusta (páginas ejecutables, 0xCC y 0x00) */
 static intptr_t find_code_cave(pid_t pid, intptr_t start, size_t need) {
   uint8_t chunk[0x1000];
   intptr_t run_start = 0;
@@ -304,7 +311,7 @@ static int hook_func(pid_t pid, uint32_t handle, intptr_t mapbase, const char *s
   }
   log_bytes(sym, addr, h);
 
-  bool is_patched = (h[0] == 0xE9);
+  bool is_patched = is_hooked_thunk(h);
   intptr_t cave = 0;
 
   if (is_patched) {
